@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { bestCandidate, isSelector, lookFails, lookProblems, parseSteps, planWords, resolveUrl, seeVerdict, stepLabel, tokenize } from './steps.ts'
+import { bestCandidate, dialogPolicy, isSelector, lighthouseSummary, lookFails, lookProblems, parseSteps, planWords, resolveUrl, seeVerdict, stepLabel, tokenize } from './steps.ts'
 
 test('tokenize keeps quoted words whole and stops at a comment', () => {
   assert.deepEqual(tokenize(`fill "Message" 'hi there'  # say hi`), ['fill', 'Message', 'hi there'])
@@ -26,6 +26,33 @@ test('inspection steps parse', () => {
   assert.deepEqual(parseSteps(['console', 'network', '/api', 'response', '/api/me', 'cookies', 'storage', 'a11y']), [
     { verb: 'console' }, { verb: 'network', filter: '/api' }, { verb: 'response', filter: '/api/me' }, { verb: 'cookies' }, { verb: 'storage' }, { verb: 'a11y' },
   ])
+})
+
+test('drag, upload, dialog, trace and the audits parse; trace takes start or stop', () => {
+  assert.deepEqual(parseSteps(['drag', 'Card 1', 'Done', 'upload', 'Attach', './a.png', 'dialog', 'accept', 'trace', 'start', 'perf', 'heap', 'lighthouse', 'trace', 'stop']), [
+    { verb: 'drag', target: 'Card 1', value: 'Done' }, { verb: 'upload', target: 'Attach', value: './a.png' }, { verb: 'dialog', answer: 'accept' },
+    { verb: 'trace', action: 'start' }, { verb: 'perf' }, { verb: 'heap' }, { verb: 'lighthouse' }, { verb: 'trace', action: 'stop' },
+  ])
+  assert.throws(() => parseSteps(['trace', 'go']), /start or stop/)
+})
+
+test('dialogPolicy: accept, dismiss, or a prompt answer', () => {
+  assert.deepEqual(dialogPolicy('accept'), { accept: true })
+  assert.deepEqual(dialogPolicy('dismiss'), { accept: false })
+  assert.deepEqual(dialogPolicy('Ada'), { accept: true, text: 'Ada' })
+})
+
+test('lighthouseSummary: scores, metrics, worst scored audits first, informative ones left out', () => {
+  const lines = lighthouseSummary({
+    categories: { performance: { title: 'Performance', score: 0.72 }, accessibility: { title: 'Accessibility', score: 1 } },
+    audits: {
+      'largest-contentful-paint': { title: 'Largest Contentful Paint', score: 0.5, scoreDisplayMode: 'numeric', displayValue: '3.1 s' },
+      'color-contrast': { title: 'Contrast', score: 0, scoreDisplayMode: 'binary' },
+      'diagnostics': { title: 'Diagnostics', score: null, scoreDisplayMode: 'informative' },
+      'fine': { title: 'Fine', score: 1, scoreDisplayMode: 'binary' },
+    },
+  })
+  assert.deepEqual(lines, ['Performance 72, Accessibility 100', 'Largest Contentful Paint: 3.1 s', 'worst audits:', '  0  Contrast', ' 50  Largest Contentful Paint (3.1 s)'])
 })
 
 test('parseSteps names an unknown verb and a missing argument', () => {

@@ -11,9 +11,9 @@ question) looks at the screenshot only where a step needs a judgment. A ten-step
 seconds and well under a cent, against minutes and many thousands of context tokens with the
 browser MCPs.
 
-**Default for every browser check.** Reach for the Playwright or Chrome DevTools MCP only when
-ui-check cannot do the job: drag and drop, file uploads, native dialogs, performance traces,
-memory snapshots, Lighthouse audits, or when the user asks for that tool by name.
+**Default for every browser check**, including drag and drop, uploads, dialogs, performance,
+memory and Lighthouse. Reach for the Chrome DevTools MCP only for what ui-check has no step for
+(network or CPU throttling, breakpoints, live CSS editing) or when the user asks for it by name.
 
 ## Run it
 
@@ -31,12 +31,21 @@ Run `ui-check --help` for the whole list. The main steps:
 - `see CLAIM` / `nosee CLAIM`: the classifier checks the screenshot (and visible text) for CLAIM; prints `p`; fails when wrong. Write claims about what a person would see: `see "the thread shows a reply from the agent"`.
 - `look`: health check of the screen: an error screen fails; blank, stuck loading or broken layout warn.
 - `wait SECONDS|TEXT`, `press KEY`, `scroll down|up|TEXT`, `phone`, `desktop`, `dark`, `light`, `back`, `reload`.
+- `drag FROM TO`: drags one element onto another (HTML5 drag and drop works); each is found as `click` finds it, or by its text.
+- `upload TARGET FILE`: into the file field TARGET names, or through the picker the control TARGET opens (a hidden input works); falls back to the page's first file input.
+- `dialog accept|dismiss|TEXT`: how alert, confirm and prompt dialogs are answered from that step on (TEXT answers a prompt). Without it every dialog is dismissed, so a "Delete everything?" confirm never goes through by accident. Each dialog prints an `info` line.
 - `read` prints the visible text (2,000 characters); `eval JS` prints a value; `shot` saves a screenshot and prints its path.
 - Inspecting, like the browser devtools (all of it from the current run, so put these steps after the actions they are about):
   - `console`: every console message and page error, all levels.
   - `network FILTER`: requests with method, status, time and type; FILTER is part of the URL, a type (`fetch`, `xhr`, `document`) or a status (`404`, `failed`); `""` for all.
   - `response FILTER`: the latest matching response's status, headers (cookie and auth headers hidden) and body.
   - `cookies` (values never printed), `storage` (localStorage and sessionStorage), `a11y` (the accessibility tree, roles and names).
+- Performance and memory:
+  - `perf`: TTFB, DOMContentLoaded, load, LCP and CLS, script, layout and style time since the run began, element count, bytes, JS heap.
+  - `heap`: garbage-collects, then saves a memory snapshot (`.heapsnapshot`, for the DevTools Memory tab) and prints heap size, DOM nodes and listeners. A second `heap` in the same run prints the change, so `heap` before and after repeating an action is a quick leak check.
+  - `trace start` ... `trace stop`: a performance trace (`.json`, for the DevTools Performance panel) of the steps between.
+  - `lighthouse`: a Lighthouse audit of the current page (desktop preset, or mobile at `phone` width) with scores, the main metrics, the worst audits and the report path. Takes 20 to 60 s; the first run downloads Lighthouse. The page's storage and sign-in are kept.
+- Files (screenshots, snapshots, traces, reports) go to `$TMPDIR/agents-ui-check` and are deleted after a day.
 - `--plan FILE`: one step per line, shell quoting, `#` comments. Keep reusable walks in the project.
 - Hidden by default: Chrome runs headless and never comes up on the screen. `--show` uses a visible window instead; `--slow` shows it and pauses between steps. Use those only when the user wants to watch. The hidden and visible Chromes keep separate profiles, so each needs its own sign-in.
 

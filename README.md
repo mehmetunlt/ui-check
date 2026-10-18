@@ -15,6 +15,8 @@ ui-check --base http://localhost:3000 \
 - Chrome runs hidden (headless) and stays open between runs with its own profile, so sign-ins are kept. `--show` and `--slow` use a visible window; `--close` stops it.
 - `see`, `nosee` and `look` ask the classifier about the screenshot. A click or fill whose words match nothing asks it which visible control they mean.
 - `console`, `network`, `response`, `cookies`, `storage` and `a11y` inspect the page like the browser devtools.
+- `drag`, `upload` and `dialog` cover drag and drop, file pickers and alert, confirm and prompt dialogs.
+- `perf`, `heap` (memory snapshots and leak deltas), `trace start|stop` and `lighthouse` (run on demand with npx, pinned) cover performance and memory.
 
 ## Install
 

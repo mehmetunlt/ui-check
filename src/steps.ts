@@ -7,7 +7,9 @@ import type { QuickQuestion } from './classifier/quick-check.ts'
 export type Step =
   | { verb: 'open'; target: string }
   | { verb: 'click' | 'hover'; target: string }
-  | { verb: 'fill' | 'select'; target: string; value: string }
+  | { verb: 'fill' | 'select' | 'drag' | 'upload'; target: string; value: string }
+  | { verb: 'dialog'; answer: string }
+  | { verb: 'trace'; action: 'start' | 'stop' }
   | { verb: 'press'; key: string }
   | { verb: 'wait'; seconds: number }
   | { verb: 'wait'; text: string }
@@ -16,12 +18,12 @@ export type Step =
   | { verb: 'eval'; script: string }
   | { verb: 'network'; filter: string }
   | { verb: 'response'; filter: string }
-  | { verb: 'phone' | 'desktop' | 'dark' | 'light' | 'shot' | 'read' | 'look' | 'back' | 'reload' | 'console' | 'cookies' | 'storage' | 'a11y' }
+  | { verb: 'phone' | 'desktop' | 'dark' | 'light' | 'shot' | 'read' | 'look' | 'back' | 'reload' | 'console' | 'cookies' | 'storage' | 'a11y' | 'perf' | 'heap' | 'lighthouse' }
 
 /** How many words each verb takes after it. */
 export const VERB_ARITY: Record<Step['verb'], number> = {
   open: 1, click: 1, hover: 1, fill: 2, select: 2, press: 1, wait: 1, see: 1, nosee: 1, scroll: 1, eval: 1,
-  network: 1, response: 1,
+  network: 1, response: 1, drag: 2, upload: 2, dialog: 1, trace: 1, perf: 0, heap: 0, lighthouse: 0,
   phone: 0, desktop: 0, dark: 0, light: 0, shot: 0, read: 0, look: 0, back: 0, reload: 0, console: 0, cookies: 0, storage: 0, a11y: 0,
 }
 
@@ -33,6 +35,11 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
   fill FIELD VALUE     a field by label, placeholder or name (classifier fallback as for click)
   select FIELD OPTION  pick an option in a select
   press KEY            Enter, Escape, Tab, Meta+k…
+  drag FROM TO         drag one element onto another (each found as click finds it, or by its text)
+  upload TARGET FILE   a file into the file field TARGET names, or through the picker the control TARGET opens;
+                       falls back to the page's first file input
+  dialog accept|dismiss|TEXT  how this run answers alert, confirm and prompt dialogs from here on (TEXT: accept a
+                       prompt with TEXT); without it every dialog is dismissed, and each one is printed
   wait SECONDS|TEXT    sleep, or wait up to 15 s for TEXT to show
   see CLAIM            the classifier checks the screenshot shows CLAIM (fails when it does not)
   nosee CLAIM          the classifier checks the screenshot does not show CLAIM
@@ -50,8 +57,16 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
   cookies              the page's cookies (name, domain, flags, value length; values never printed)
   storage              localStorage and sessionStorage keys with their values clipped
   a11y                 the accessibility tree of the page (roles and names, 3,000 characters)
+  perf                 load timings (TTFB, DOMContentLoaded, load, LCP, CLS), script and layout time since the run
+                       began, DOM size, bytes
+  heap                 garbage-collect, then a memory snapshot (.heapsnapshot for the DevTools Memory tab) with heap
+                       size, DOM nodes and listeners, and the change since this run's last heap
+  trace start|stop     a performance trace between the two (a .json for the DevTools Performance panel)
+  lighthouse           a Lighthouse audit of the current page (desktop, or mobile at phone width): scores, metrics,
+                       the worst audits and the report path; takes 20 to 60 s; keeps the page's storage and sign-in
   back | reload
 A plan file has one step per line, quoted like a shell ("…" or '…'), # for comments.
+Screenshots, snapshots, traces and reports go to $TMPDIR/agents-ui-check and are deleted after a day.
 Chrome runs hidden (headless) and stays open between runs (one tab, its own profile, so sign-in is kept).
 --show uses a visible window instead (its own profile and sign-ins); --slow shows it and pauses between
 steps so a person can watch; --close stops the Chrome a run used (alone: both).`
@@ -101,7 +116,12 @@ export function parseSteps(words: readonly string[]): Step[] {
     i += 1 + arity
     switch (verb) {
       case 'open': case 'scroll': case 'click': case 'hover': steps.push({ verb, target: args[0]! }); break
-      case 'fill': case 'select': steps.push({ verb, target: args[0]!, value: args[1]! }); break
+      case 'fill': case 'select': case 'drag': case 'upload': steps.push({ verb, target: args[0]!, value: args[1]! }); break
+      case 'dialog': steps.push({ verb, answer: args[0]! }); break
+      case 'trace':
+        if (args[0] !== 'start' && args[0] !== 'stop') throw new Error('"trace" takes start or stop')
+        steps.push({ verb, action: args[0] })
+        break
       case 'press': steps.push({ verb, key: args[0]! }); break
       case 'see': case 'nosee': steps.push({ verb, claim: args[0]! }); break
       case 'eval': steps.push({ verb, script: args[0]! }); break
@@ -132,7 +152,9 @@ export function stepLabel(s: Step): string {
   const q = (v: string) => JSON.stringify(v.length > 70 ? `${v.slice(0, 67)}...` : v)
   switch (s.verb) {
     case 'open': case 'click': case 'hover': case 'scroll': return `${s.verb} ${q(s.target)}`
-    case 'fill': case 'select': return `${s.verb} ${q(s.target)} ${q(s.value)}`
+    case 'fill': case 'select': case 'drag': case 'upload': return `${s.verb} ${q(s.target)} ${q(s.value)}`
+    case 'dialog': return `dialog ${q(s.answer)}`
+    case 'trace': return `trace ${s.action}`
     case 'press': return `press ${s.key}`
     case 'wait': return 'seconds' in s ? `wait ${s.seconds}s` : `wait ${q(s.text)}`
     case 'see': case 'nosee': return `${s.verb} ${q(s.claim)}`
@@ -206,4 +228,31 @@ export function bestCandidate(answers: ReadonlyArray<{ item?: string; p: number 
     if (!best || a.p > best.p) best = { idx: Number(a.item), p: a.p }
   }
   return best
+}
+
+/** What a dialog step asks for: accept, dismiss, or accept a prompt with this text. */
+export function dialogPolicy(answer: string): { accept: boolean; text?: string } {
+  if (answer === 'dismiss') return { accept: false }
+  if (answer === 'accept') return { accept: true }
+  return { accept: true, text: answer }
+}
+
+type LhAudit = { title?: string; score?: number | null; scoreDisplayMode?: string; displayValue?: string }
+type LhReport = { categories?: Record<string, { title?: string; score?: number | null }>; audits?: Record<string, LhAudit> }
+
+export const LIGHTHOUSE_METRICS = ['first-contentful-paint', 'largest-contentful-paint', 'total-blocking-time', 'cumulative-layout-shift', 'speed-index'] as const
+
+/** A Lighthouse JSON report as a few lines: category scores, the main metrics, the worst scored audits. */
+export function lighthouseSummary(r: LhReport, worst = 12): string[] {
+  const pct = (n: number | null | undefined) => (typeof n === 'number' ? String(Math.round(n * 100)) : '-')
+  const lines = [Object.values(r.categories ?? {}).map((c) => `${c.title ?? '?'} ${pct(c.score)}`).join(', ')]
+  const metrics = LIGHTHOUSE_METRICS.map((id) => r.audits?.[id]).filter((a): a is LhAudit => !!a?.displayValue).map((a) => `${a.title}: ${a.displayValue}`)
+  if (metrics.length) lines.push(metrics.join(', '))
+  const bad = Object.values(r.audits ?? {})
+    .filter((a) => typeof a.score === 'number' && a.score < 0.9 && (a.scoreDisplayMode === 'binary' || a.scoreDisplayMode === 'numeric' || a.scoreDisplayMode === 'metricSavings'))
+    .sort((a, b) => a.score! - b.score!)
+    .slice(0, worst)
+    .map((a) => `${pct(a.score).padStart(3)}  ${a.title}${a.displayValue ? ` (${a.displayValue})` : ''}`)
+  if (bad.length) lines.push('worst audits:', ...bad)
+  return lines
 }

@@ -16,17 +16,18 @@
  * wrote, never by pattern. Screenshots go to
  * $TMPDIR/agents-ui-check and their paths are printed (on `shot` and on every failure).
  */
-import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { execFile, spawn } from 'node:child_process'
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { chromium, type Locator, type Page, type Response } from 'playwright-core'
+import { join, resolve } from 'node:path'
+import { promisify } from 'node:util'
+import { chromium, type Browser, type CDPSession, type Locator, type Page, type Response } from 'playwright-core'
 import { createDecisions } from './classifier/client.ts'
 import { quickCheck, type QuickQuestion } from './classifier/quick-check.ts'
 import type { Decisions } from './classifier/types.ts'
 import { fitForLook } from './look-image.ts'
 import {
-  LOOK_QUESTIONS, SEE_ID, USAGE, bestCandidate, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
+  LOOK_QUESTIONS, SEE_ID, USAGE, bestCandidate, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
   resolveUrl, seeQuestion, seeVerdict, stepLabel, type Candidate, type Step,
 } from './steps.ts'
 
@@ -119,6 +120,85 @@ const consoleLog: string[] = []
 type NetEntry = { method: string; url: string; status: number | 'failed'; ms: number; type: string; response: Response | null; error?: string }
 const netLog: NetEntry[] = []
 const NET_KEEP = 1_000
+const infos: string[] = [] // dialogs and the like: printed, not counted as warnings
+let dialogAnswer: { accept: boolean; text?: string } = { accept: false }
+let browserRef: Browser | null = null
+// Chrome counts script, layout and style time only while Performance is on: on from the run's start.
+let perfSession: CDPSession | null = null
+let tracing: string | null = null
+let lastHeap: { used: number; nodes: number; listeners: number } | null = null
+const LIGHTHOUSE = 'lighthouse@13.5.0'
+const run$ = promisify(execFile)
+const stamp = () => new Date().toISOString().replace(/[:.]/g, '-')
+const mb = (n: number) => `${(n / 1_048_576).toFixed(1)} MB`
+const VITALS_JS = `(async () => {
+  const nav = performance.getEntriesByType('navigation')[0]
+  let lcp = null, cls = 0
+  try { new PerformanceObserver((l) => { const e = l.getEntries(); if (e.length) lcp = e[e.length - 1].startTime }).observe({ type: 'largest-contentful-paint', buffered: true }) } catch {}
+  try { new PerformanceObserver((l) => { for (const e of l.getEntries()) if (!e.hadRecentInput) cls += e.value }).observe({ type: 'layout-shift', buffered: true }) } catch {}
+  await new Promise((r) => setTimeout(r, 100))
+  const res = performance.getEntriesByType('resource')
+  const r = (n) => (typeof n === 'number' && n > 0 ? Math.round(n) : null)
+  return {
+    ttfb: nav ? r(nav.responseStart) : null, dcl: nav ? r(nav.domContentLoadedEventEnd) : null, load: nav ? r(nav.loadEventEnd) : null,
+    lcp: r(lcp), cls: Math.round(cls * 1000) / 1000, resources: res.length,
+    kb: Math.round(res.reduce((a, e) => a + (e.transferSize || 0), 0) / 1024), elements: document.getElementsByTagName('*').length,
+  }
+})()`
+
+/** Chrome's own counters for the page (heap, DOM nodes, listeners, script and layout time). */
+async function metrics(page: Page): Promise<Record<string, number>> {
+  if (!perfSession) {
+    perfSession = await page.context().newCDPSession(page)
+    await perfSession.send('Performance.enable')
+  }
+  const { metrics: m } = await perfSession.send('Performance.getMetrics')
+  return Object.fromEntries(m.map((x) => [x.name, x.value]))
+}
+
+/** Screenshots, snapshots, traces and reports from earlier days go (a heap snapshot is tens of MB). */
+function sweepOld(): void {
+  try {
+    const cutoff = Date.now() - 24 * 3600 * 1000
+    for (const f of readdirSync(SHOTS)) {
+      const p = join(SHOTS, f)
+      if (statSync(p).mtimeMs < cutoff) rmSync(p, { force: true })
+    }
+  } catch {}
+}
+
+async function heapSnapshot(page: Page): Promise<{ file: string; bytes: number }> {
+  mkdirSync(SHOTS, { recursive: true })
+  const file = join(SHOTS, `${stamp()}.heapsnapshot`)
+  const out = createWriteStream(file)
+  const cdp = await page.context().newCDPSession(page)
+  try {
+    cdp.on('HeapProfiler.addHeapSnapshotChunk', (e) => { out.write(e.chunk) })
+    await cdp.send('HeapProfiler.enable')
+    await cdp.send('HeapProfiler.collectGarbage')
+    await cdp.send('HeapProfiler.takeHeapSnapshot', { reportProgress: false })
+  } finally {
+    await new Promise<void>((r) => out.end(() => r()))
+    await cdp.detach().catch(() => {})
+  }
+  return { file, bytes: statSync(file).size }
+}
+
+async function lighthouse(page: Page): Promise<Outcome> {
+  const url = page.url()
+  if (!/^https?:/.test(url)) return { ok: false, note: 'open a page first' }
+  mkdirSync(SHOTS, { recursive: true })
+  const report = join(SHOTS, `${stamp()}-lighthouse.json`)
+  const desktop = (page.viewportSize()?.width ?? DESKTOP.width) > 600
+  // Our Chrome on its debug port; storage is kept so the sign-in survives the audit.
+  const args = ['-y', LIGHTHOUSE, url, `--port=${mode.port}`, '--output=json', `--output-path=${report}`, '--quiet', '--disable-storage-reset',
+    '--only-categories=performance,accessibility,best-practices,seo', ...(desktop ? ['--preset=desktop'] : [])]
+  try { await run$('npx', args, { timeout: 240_000, maxBuffer: 64 * 1024 * 1024 }) }
+  catch (e) { return { ok: false, note: `lighthouse failed: ${String((e as { stderr?: string }).stderr || (e as Error).message).trim().split('\n').pop()?.slice(0, 200)}` } }
+  const r = JSON.parse(readFileSync(report, 'utf8'))
+  return { ok: true, note: `${desktop ? 'desktop' : 'mobile'}, report ${report}`, print: lighthouseSummary(r).join('\n') }
+}
+
 const STORAGE_JS = `(() => {
   const dump = (st) => { const o = {}; for (let i = 0; i < st.length; i++) { const k = st.key(i); const v = st.getItem(k) || ''; o[k] = v.length > 120 ? v.slice(0, 117) + '...' : v } return o }
   try { return { localStorage: dump(localStorage), sessionStorage: dump(sessionStorage) } } catch (e) { return { error: String(e) } }
@@ -259,6 +339,82 @@ async function run(page: Page, s: Step): Promise<Outcome> {
       else await hit.loc.selectOption({ label: s.value }, { timeout: 8_000 })
       return { ok: true, note: hit.how }
     }
+    case 'drag': {
+      const from = await find(page, 'click', s.target)
+      if (!from) return { ok: false, note: 'nothing matches the start' }
+      await from.loc.scrollIntoViewIfNeeded()
+      const a = await from.loc.boundingBox()
+      // Found after the start's box is read: a classifier pick re-marks the page.
+      const to = await find(page, 'click', s.value)
+      if (!to) return { ok: false, note: 'nothing matches the target' }
+      const b = await to.loc.boundingBox()
+      if (!a || !b) return { ok: false, note: 'an element has no box on screen' }
+      const ax = a.x + a.width / 2, ay = a.y + a.height / 2
+      await page.mouse.move(ax, ay)
+      await page.mouse.down()
+      await page.mouse.move(ax + 6, ay + 6, { steps: 3 })
+      await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2, { steps: 16 })
+      await page.mouse.up()
+      await settle(page)
+      return { ok: true, note: `${from.how} onto ${to.how}` }
+    }
+    case 'upload': {
+      const file = resolve(s.value)
+      if (!existsSync(file)) return { ok: false, note: `no such file: ${file}` }
+      const hit = await find(page, 'click', s.target)
+      if (hit) {
+        if (await hit.loc.evaluate(`(el) => el.tagName === 'INPUT' && el.type === 'file'`)) {
+          await hit.loc.setInputFiles(file)
+          return { ok: true, note: `${hit.how}, file field` }
+        }
+        const chooser = page.waitForEvent('filechooser', { timeout: 5_000 }).catch(() => null)
+        await hit.loc.click({ timeout: 8_000 })
+        const picker = await chooser
+        if (picker) { await picker.setFiles(file); await settle(page); return { ok: true, note: `${hit.how}, file picker` } }
+      }
+      const input = page.locator('input[type=file]')
+      if (!(await input.count())) return { ok: false, note: 'no file field or picker found' }
+      await input.first().setInputFiles(file)
+      await settle(page)
+      return { ok: true, note: "the page's first file input" }
+    }
+    case 'dialog':
+      dialogAnswer = dialogPolicy(s.answer)
+      return { ok: true, note: dialogAnswer.accept ? `dialogs accepted${dialogAnswer.text !== undefined ? ` with "${dialogAnswer.text}"` : ''}` : 'dialogs dismissed' }
+    case 'perf': {
+      const v = await page.evaluate<Record<string, number | null>>(VITALS_JS)
+      const m = await metrics(page)
+      const ms = (n: number | null | undefined) => (n == null ? '-' : `${n} ms`)
+      return { ok: true, print: [
+        `TTFB ${ms(v.ttfb)}, DOMContentLoaded ${ms(v.dcl)}, load ${ms(v.load)}, LCP ${ms(v.lcp)}, CLS ${v.cls}`,
+        `since this run began: script ${Math.round((m.ScriptDuration ?? 0) * 1000)} ms, layout ${Math.round((m.LayoutDuration ?? 0) * 1000)} ms, style ${Math.round((m.RecalcStyleDuration ?? 0) * 1000)} ms, tasks ${Math.round((m.TaskDuration ?? 0) * 1000)} ms`,
+        `${v.elements} elements, ${v.resources} resources, ${v.kb} KB transferred, JS heap ${mb(m.JSHeapUsedSize ?? 0)}`,
+      ].join('\n') }
+    }
+    case 'heap': {
+      const snap = await heapSnapshot(page)
+      const m = await metrics(page)
+      const now = { used: m.JSHeapUsedSize ?? 0, nodes: m.Nodes ?? 0, listeners: m.JSEventListeners ?? 0 }
+      const d = lastHeap ? `; since the last heap: ${now.used >= lastHeap.used ? '+' : ''}${mb(now.used - lastHeap.used)}, ${now.nodes - lastHeap.nodes >= 0 ? '+' : ''}${now.nodes - lastHeap.nodes} nodes, ${now.listeners - lastHeap.listeners >= 0 ? '+' : ''}${now.listeners - lastHeap.listeners} listeners` : ''
+      lastHeap = now
+      return { ok: true, note: `snapshot ${snap.file} (${mb(snap.bytes)})`, print: `JS heap ${mb(now.used)} of ${mb(m.JSHeapTotalSize ?? 0)}, ${now.nodes} DOM nodes, ${now.listeners} listeners, ${m.Documents ?? 0} documents${d}` }
+    }
+    case 'trace': {
+      if (!browserRef) return { ok: false, note: 'no browser' }
+      if (s.action === 'start') {
+        if (tracing) return { ok: false, note: 'a trace is already running' }
+        mkdirSync(SHOTS, { recursive: true })
+        tracing = join(SHOTS, `${stamp()}-trace.json`)
+        await browserRef.startTracing(page, { path: tracing, screenshots: true })
+        return { ok: true, note: 'tracing' }
+      }
+      if (!tracing) return { ok: false, note: 'no trace started in this run' }
+      await browserRef.stopTracing()
+      const file = tracing
+      tracing = null
+      return { ok: true, note: `${file} (${mb(statSync(file).size)}), open it in the DevTools Performance panel` }
+    }
+    case 'lighthouse': return lighthouse(page)
     case 'press':
       await page.keyboard.press(s.key)
       await settle(page)
@@ -335,12 +491,24 @@ async function main(): Promise<void> {
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${mode.port}`)
   const ctx = browser.contexts()[0] ?? (await browser.newContext())
   const page = ctx.pages()[0] ?? (await ctx.newPage())
+  browserRef = browser
+  sweepOld()
+  await metrics(page).catch(() => {})
   if (show) await page.bringToFront().catch(() => {})
   await page.setViewportSize(DESKTOP)
   const origin = () => { try { return new URL(base).origin } catch { return '' } }
   page.on('pageerror', (e) => {
     pageErrors.push(e.message.split('\n')[0]!.slice(0, 200))
     consoleLog.push(`[pageerror] ${e.message.slice(0, 500)}`)
+  })
+  page.on('dialog', (d) => {
+    // beforeunload is always let through, so a navigation step is never held on the page.
+    const accept = d.type() === 'beforeunload' || dialogAnswer.accept
+    const answered = accept ? d.accept(d.type() === 'prompt' ? dialogAnswer.text ?? d.defaultValue() : undefined) : d.dismiss()
+    void answered.catch(() => {})
+    const line = `dialog ${d.type()} "${d.message().slice(0, 160)}" ${accept ? 'accepted' : 'dismissed'}`
+    infos.push(line)
+    consoleLog.push(`[dialog] ${line}`)
   })
   page.on('console', (m) => {
     consoleLog.push(`[${m.type()}] ${m.text().slice(0, 500)}`)
@@ -371,12 +539,17 @@ async function main(): Promise<void> {
     const ms = Date.now() - began
     console.log(`${out.ok ? 'ok  ' : 'FAIL'} ${stepLabel(s)}${out.note ? `  ${out.note}` : ''}  (${ms} ms)`)
     if (out.print !== undefined) console.log(out.print.split('\n').map((l) => `     ${l}`).join('\n'))
+    for (const n of infos.splice(0)) console.log(`info ${n}`)
     if (pending.length) {
       const notes = [...new Set(pending)]
       warnings += notes.length
       for (const n of notes.slice(0, 6)) console.log(`warn ${n}`)
       pending.length = 0
     }
+  }
+  if (tracing && browserRef) {
+    await browserRef.stopTracing().catch(() => {})
+    console.log(`info the trace was still running and is saved: ${tracing}`)
   }
   const secs = ((Date.now() - t0) / 1000).toFixed(1)
   console.log(`\n${steps.length} steps, ${failures} failed, ${warnings} warnings, ${calls} classifier calls ($${(costMicroUsd / 1e6).toFixed(4)}), ${secs} s`)
