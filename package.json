@@ -1,0 +1,24 @@
+{
+  "name": "ui-check",
+  "private": true,
+  "type": "module",
+  "description": "Scripted browser checks in one persistent Chrome, judged by a fast image classifier.",
+  "scripts": {
+    "check": "tsx src/main.ts",
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node22 --external:playwright-core --external:@napi-rs/canvas --outfile=dist/ui-check.mjs --log-level=warning",
+    "install:global": "sh scripts/install.sh",
+    "test": "node --test --import tsx src/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "1.0.11",
+    "playwright-core": "1.63.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "esbuild": "0.25.12",
+    "tsx": "^4.21.0",
+    "typescript": "^5.8.3"
+  },
+  "engines": { "node": ">=22" }
+}
