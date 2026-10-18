@@ -220,8 +220,12 @@ async function ask(input: Parameters<typeof quickCheck>[1]) {
   return out.answers
 }
 
+// Animations are left running. Playwright's animations: 'disabled' finishes
+// finite CSS animations by firing animationend, and apps react to that: a
+// react-toastify toast closes when its progress bar animation ends, so every
+// `see` dismissed the toast it was asked about.
 async function screenshot(page: Page): Promise<Uint8Array> {
-  return new Uint8Array(await page.screenshot({ type: 'png', animations: 'disabled', caret: 'hide' }))
+  return new Uint8Array(await page.screenshot({ type: 'png', caret: 'hide' }))
 }
 
 async function saveShot(page: Page, why: string): Promise<string> {
