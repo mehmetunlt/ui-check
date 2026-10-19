@@ -6,8 +6,9 @@
  * comes back. The classifier (jev-1.14 with images, through the decisions client) is asked only
  * where a step needs a judgment: `see`/`nosee` and the health `look` send the viewport screenshot
  * with the visible text as context, and a click or fill whose words match nothing asks which
- * visible control they mean. Every step also reports new page errors (fail), console errors and
- * failed same-origin requests (warn); `look` fails on an error screen and warns on a blank or broken one.
+ * visible control they mean. Every step also reports new page errors (fail, or warn on a page that
+ * loaded and rendered), console errors and failed same-origin requests (warn), less what `ignore`
+ * matches; `look` fails on an error screen and warns on a blank or broken one.
  *
  * Chrome keeps running between runs with its own profile under ~/.cache/agents-ui-check, so a
  * sign-in is kept; each session reuses a tab of its own (session.ts). By default it is headless (port 9334), so
@@ -27,7 +28,7 @@ import { quickCheck, type QuickQuestion } from './classifier/quick-check.ts'
 import type { Decisions } from './classifier/types.ts'
 import { fitForLook } from './look-image.ts'
 import {
-  LOOK_QUESTIONS, SEE_ID, USAGE, bestCandidate, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
+  LOOK_QUESTIONS, SEE_ID, USAGE, bestCandidate, ignoredBy, pageErrorsFail, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
   rankMatches, resolveUrl, seeQuestion, seeVerdict, splitOrdinal, stepLabel, type Candidate, type MatchInfo, type Step,
 } from './steps.ts'
 import { acquireLock, activeSessions, callerId, listProcs, lockHolder, projectRoot, readRegistry, sessionKey, staleSessions, writeRegistry } from './session.ts'
@@ -167,8 +168,12 @@ let calls = 0
 let failures = 0
 let warnings = 0
 let shotN = 0
-const pending: string[] = [] // console and network notes since the last step
-let pageErrors: string[] = []
+// Console and network notes since the last step, with the URL they are about (for ignore).
+const pending: Array<{ text: string; url?: string }> = []
+const pageErrors: string[] = []
+const ignores: string[] = []
+// The status of the document this step loaded, if it loaded one.
+let stepDoc: number | null = null
 // Everything this run saw, for the console and network steps.
 const consoleLog: string[] = []
 type NetEntry = { method: string; url: string; status: number | 'failed'; ms: number; type: string; response: Response | null; error?: string }
@@ -252,6 +257,11 @@ async function lighthouse(page: Page): Promise<Outcome> {
   const r = JSON.parse(readFileSync(report, 'utf8'))
   return { ok: true, note: `${desktop ? 'desktop' : 'mobile'}, report ${report}`, print: lighthouseSummary(r).join('\n') }
 }
+
+const RENDERED_JS = `(() => {
+  const text = (document.body ? document.body.innerText : '').trim()
+  return { textChars: text.length, media: document.querySelectorAll('img, svg, canvas, video').length, text: text.slice(0, 500) }
+})()`
 
 const STORAGE_JS = `(() => {
   const dump = (st) => { const o = {}; for (let i = 0; i < st.length; i++) { const k = st.key(i); const v = st.getItem(k) || ''; o[k] = v.length > 120 ? v.slice(0, 117) + '...' : v } return o }
@@ -520,6 +530,9 @@ async function run(page: Page, s: Step): Promise<Outcome> {
       await settle(page)
       return { ok: true, note: "the page's first file input" }
     }
+    case 'ignore':
+      ignores.push(s.pattern)
+      return { ok: true }
     case 'dialog':
       dialogAnswer = dialogPolicy(s.answer)
       return { ok: true, note: dialogAnswer.accept ? `dialogs accepted${dialogAnswer.text !== undefined ? ` with "${dialogAnswer.text}"` : ''}` : 'dialogs dismissed' }
@@ -657,7 +670,7 @@ async function main(): Promise<void> {
   })
   page.on('console', (m) => {
     consoleLog.push(`[${m.type()}] ${m.text().slice(0, 500)}`)
-    if (m.type() === 'error') pending.push(`console: ${m.text().split('\n')[0]!.slice(0, 200)}`)
+    if (m.type() === 'error') pending.push({ text: `console: ${m.text().split('\n')[0]!.slice(0, 200)}`, url: m.location().url })
   })
   const logRequest = (e: NetEntry) => { netLog.push(e); if (netLog.length > NET_KEEP) netLog.shift() }
   page.on('requestfinished', (r) => {
@@ -667,26 +680,38 @@ async function main(): Promise<void> {
     }).catch(() => {})
   })
   // Server errors on any request, refusals on writes (a GET 401 on the sign-in page is expected).
-  page.on('response', (r) => { if ((r.status() >= 500 || (r.status() >= 400 && r.request().method() !== 'GET')) && r.url().startsWith(origin())) pending.push(`${r.status()} ${r.request().method()} ${r.url().replace(origin(), '')}`) })
+  page.on('response', (r) => {
+    if (r.request().isNavigationRequest() && r.frame() === page.mainFrame()) stepDoc = r.status()
+    if ((r.status() >= 500 || (r.status() >= 400 && r.request().method() !== 'GET')) && r.url().startsWith(origin())) pending.push({ text: `${r.status()} ${r.request().method()} ${r.url().replace(origin(), '')}`, url: r.url() })
+  })
   page.on('requestfailed', (r) => {
     const why = r.failure()?.errorText ?? ''
     logRequest({ method: r.method(), url: r.url(), status: 'failed', ms: Math.max(0, Math.round(r.timing().responseEnd)), type: r.resourceType(), response: null, error: why })
-    if (r.url().startsWith(origin()) && !/ERR_ABORTED/.test(why)) pending.push(`failed ${r.method()} ${r.url().replace(origin(), '')}: ${why}`)
+    if (r.url().startsWith(origin()) && !/ERR_ABORTED/.test(why)) pending.push({ text: `failed ${r.method()} ${r.url().replace(origin(), '')}: ${why}`, url: r.url() })
   })
 
   for (const [i, s] of steps.entries()) {
     if (i > 0 && pauseMs) await sleep(pauseMs)
     const began = Date.now()
+    stepDoc = null
     let out: Outcome
     try { out = await run(page, s) } catch (e) { out = { ok: false, note: (e as Error).message.split('\n')[0]!.slice(0, 200) } }
-    if (pageErrors.length) { out = { ok: false, note: [out.note, `page error: ${pageErrors.join('; ')}`].filter(Boolean).join('; ') }; pageErrors = [] }
+    const errors: string[] = []
+    for (const e of pageErrors.splice(0)) if (ignoredBy(ignores, e)) infos.push(`ignored: page error: ${e}`); else errors.push(e)
+    if (errors.length) {
+      // On a page that loaded and rendered, an error elsewhere (a failed server action, say) is a warning.
+      const shown = stepDoc === null ? null : await page.evaluate<{ textChars: number; media: number; text: string }>(RENDERED_JS).catch(() => null)
+      if (shown && !pageErrorsFail({ docStatus: stepDoc, ...shown })) pending.push(...errors.map((e) => ({ text: `page error: ${e}` })))
+      else out = { ok: false, note: [out.note, `page error: ${errors.join('; ')}`].filter(Boolean).join('; ') }
+    }
     if (!out.ok) { failures++; out.note = `${out.note ?? ''} [${await saveShot(page, 'fail').catch(() => 'no screenshot')}]`.trim() }
     const ms = Date.now() - began
     console.log(`${out.ok ? 'ok  ' : 'FAIL'} ${stepLabel(s)}${out.note ? `  ${out.note}` : ''}  (${ms} ms)`)
     if (out.print !== undefined) console.log(out.print.split('\n').map((l) => `     ${l}`).join('\n'))
-    for (const n of infos.splice(0)) console.log(`info ${n}`)
+    for (const n of pending.splice(0)) if (ignoredBy(ignores, n.text, n.url ?? '')) infos.push(`ignored: ${n.text}`); else pending.push(n)
+    for (const n of [...new Set(infos.splice(0))]) console.log(`info ${n}`)
     if (pending.length) {
-      const notes = [...new Set(pending)]
+      const notes = [...new Set(pending.map((n) => n.text))]
       warnings += notes.length
       for (const n of notes.slice(0, 6)) console.log(`warn ${n}`)
       pending.length = 0

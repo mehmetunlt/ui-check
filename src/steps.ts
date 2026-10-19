@@ -17,6 +17,7 @@ export type Step =
   | { verb: 'see' | 'nosee'; claim: string }
   | { verb: 'scroll'; target: string }
   | { verb: 'eval'; script: string }
+  | { verb: 'ignore'; pattern: string }
   | { verb: 'network'; filter: string }
   | { verb: 'response'; filter: string }
   | { verb: 'phone' | 'desktop' | 'dark' | 'light' | 'shot' | 'read' | 'look' | 'back' | 'reload' | 'console' | 'cookies' | 'storage' | 'a11y' | 'perf' | 'heap' | 'lighthouse' }
@@ -24,7 +25,7 @@ export type Step =
 /** How many words each verb takes after it. */
 export const VERB_ARITY: Record<Step['verb'], number> = {
   open: 1, click: 1, hover: 1, fill: 2, select: 2, press: 1, wait: 1, see: 1, nosee: 1, scroll: 1, eval: 1,
-  network: 1, response: 1, drag: 2, upload: 2, dialog: 1, trace: 1, perf: 0, heap: 0, lighthouse: 0,
+  network: 1, response: 1, ignore: 1, drag: 2, upload: 2, dialog: 1, trace: 1, perf: 0, heap: 0, lighthouse: 0,
   phone: 0, desktop: 0, dark: 0, light: 0, shot: 0, read: 0, look: 0, back: 0, reload: 0, console: 0, cookies: 0, storage: 0, a11y: 0,
 }
 
@@ -55,6 +56,8 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
   shot                 save a screenshot and print its path
   eval JS              run JS in the page and print the result: an expression, or statements as in the DevTools
                        console (the last one's value, or a top-level return's); promises are awaited
+  ignore TEXT          from here on, console errors, page errors and responses whose text or URL holds TEXT
+                       (any case, * as a wildcard) print as info instead of warn or fail: expected noise
   console              every console message and page error of this run, all levels
   network FILTER       this run's requests (method, status, time, type, URL): FILTER is part of the URL,
                        a type (fetch, xhr, document, script…) or a status (404, failed); "" for all
@@ -138,6 +141,7 @@ export function parseSteps(words: readonly string[]): Step[] {
       case 'press': steps.push({ verb, key: args[0]! }); break
       case 'see': case 'nosee': steps.push({ verb, claim: args[0]! }); break
       case 'eval': steps.push({ verb, script: args[0]! }); break
+      case 'ignore': steps.push({ verb, pattern: args[0]! }); break
       case 'network': case 'response': steps.push({ verb, filter: args[0]! }); break
       case 'wait': {
         const n = Number(args[0])
@@ -173,6 +177,7 @@ export function stepLabel(s: Step): string {
     case 'wait': return 'seconds' in s ? `wait ${s.seconds}s` : `wait ${q(s.text)}`
     case 'see': case 'nosee': return `${s.verb} ${q(s.claim)}`
     case 'eval': return `eval ${q(s.script)}`
+    case 'ignore': return `ignore ${q(s.pattern)}`
     case 'network': case 'response': return `${s.verb} ${q(s.filter)}`
     default: return s.verb
   }
@@ -217,6 +222,27 @@ export function rankMatches(ms: readonly MatchInfo[]): { index: number; why: str
     if (keep.length && keep.length < left.length) { left = keep; why ||= reason }
   }
   return { index: left[0] ?? 0, why: why || 'the first' }
+}
+
+/** The ignore pattern a warning matches, if any: part of the text, any case, * for anything. */
+export function ignoredBy(patterns: readonly string[], ...texts: string[]): string | undefined {
+  return patterns.find((p) => {
+    const re = new RegExp(p.split('*').map((x) => x.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*'), 'i')
+    return texts.some((t) => re.test(t))
+  })
+}
+
+/** Text that means the page is an error screen, though it rendered. */
+const ERROR_SCREEN = /application error: a (client|server)-side exception|unhandled runtime error|internal server error|this page could not be found/i
+
+/**
+ * Page errors fail a step unless it loaded a document with a 2xx and the page still rendered
+ * (some text or media, not an error screen): then they are warnings, like a failed side request.
+ */
+export function pageErrorsFail(o: { docStatus: number | null; textChars: number; media: number; text: string }): boolean {
+  if (o.docStatus === null || o.docStatus < 200 || o.docStatus >= 300) return true
+  if (o.textChars === 0 && o.media === 0) return true
+  return ERROR_SCREEN.test(o.text)
 }
 
 export const SEE_ID = 'claim'

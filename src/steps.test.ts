@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { bestCandidate, dialogPolicy, isSelector, lighthouseSummary, lookFails, lookProblems, parseSteps, planWords, rankMatches, resolveUrl, seeVerdict, splitOrdinal, stepLabel, tokenize, type MatchInfo } from './steps.ts'
+import { bestCandidate, ignoredBy, pageErrorsFail, dialogPolicy, isSelector, lighthouseSummary, lookFails, lookProblems, parseSteps, planWords, rankMatches, resolveUrl, seeVerdict, splitOrdinal, stepLabel, tokenize, type MatchInfo } from './steps.ts'
 
 test('tokenize keeps quoted words whole and stops at a comment', () => {
   assert.deepEqual(tokenize(`fill "Message" 'hi there'  # say hi`), ['fill', 'Message', 'hi there'])
@@ -128,4 +128,23 @@ test('rankMatches: the dialog, the uncovered, the usable, the submit button, the
   assert.deepEqual(rankMatches([m({}), m({ isSubmit: true })]), { index: 1, why: 'the submit button' })
   assert.deepEqual(rankMatches([m({ inNav: true }), m({})]), { index: 1, why: 'the one in the main content' })
   assert.deepEqual(rankMatches([m({}), m({})]), { index: 0, why: 'the first' })
+})
+
+test('ignore parses; its pattern matches text anywhere, any case, with * as a wildcard', () => {
+  assert.deepEqual(parseSteps(['ignore', '/api/flaky', 'open', '/']), [{ verb: 'ignore', pattern: '/api/flaky' }, { verb: 'open', target: '/' }])
+  assert.equal(ignoredBy(['server components'], 'page error: An error occurred in the Server Components render'), 'server components')
+  assert.equal(ignoredBy(['/api/*/status'], '503 GET /api/v1/status'), '/api/*/status')
+  assert.equal(ignoredBy(['/api/*/status'], '503 GET /api/v1/other'), undefined)
+  assert.equal(ignoredBy(['a.b'], 'axb'), undefined)
+  assert.equal(ignoredBy([], 'x'), undefined)
+})
+
+test('page errors fail unless the document loaded with a 2xx and the page rendered', () => {
+  const ok = { docStatus: 200, textChars: 120, media: 0, text: 'Earnings this month' }
+  assert.equal(pageErrorsFail(ok), false)
+  assert.equal(pageErrorsFail({ ...ok, docStatus: null }), true)
+  assert.equal(pageErrorsFail({ ...ok, docStatus: 500 }), true)
+  assert.equal(pageErrorsFail({ ...ok, textChars: 0, text: '' }), true)
+  assert.equal(pageErrorsFail({ ...ok, textChars: 0, text: '', media: 2 }), false)
+  assert.equal(pageErrorsFail({ ...ok, text: 'Application error: a client-side exception has occurred (see the browser console)' }), true)
 })

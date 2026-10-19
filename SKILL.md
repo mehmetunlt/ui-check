@@ -51,6 +51,10 @@ Run `ui-check --help` for the whole list. The main steps:
 - Hidden by default: Chrome runs headless and never comes up on the screen. `--show` uses a visible window instead; `--slow` shows it and pauses between steps. Use those only when the user wants to watch. The hidden and visible Chromes keep separate profiles, so each needs its own sign-in.
 
 Every step also reports new page errors (fail), console errors, 5xx responses and refused writes (warn).
+Page errors only warn when the step loaded a document with a 2xx and the page rendered (an unrelated
+failing server action, say); on a blank page, an error screen or after a click they fail.
+`ignore TEXT` marks expected noise: from that step on, console errors, page errors and responses whose
+text or URL holds TEXT (any case, `*` as a wildcard, e.g. `ignore '/api/*/metrics'`) print as `info`.
 The exit code is 1 when a step failed.
 
 ## Working rules

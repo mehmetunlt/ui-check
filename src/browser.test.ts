@@ -31,6 +31,12 @@ const ROUTES: Record<string, Handler> = {
     <form onsubmit="hit('submit'); return false"><input aria-label="Email"><button>Login</button></form>`),
   '/payouts': html(`${HIT}<nav><a href="#p" onclick="hit('nav')">Payouts</a><a href="#e">Earnings</a></nav>
     <main><div role="tablist"><button role="tab" onclick="hit('tab')">Overview</button><button role="tab" onclick="hit('tab')">Payouts</button></div></main>`),
+  // Rendered fine, but a script throws (a failed server action in a Next.js layout, say) and a side request 503s.
+  '/noisy': html(`<h1>Earnings</h1><p>All good here</p><script>fetch('/api/flaky'); setTimeout(() => { throw new Error('An error occurred in the Server Components render') })</script>`),
+  '/api/flaky': (_req, res) => { res.writeHead(503); res.end('busy') },
+  '/blank-error': html("<script>throw new Error('boom')</script>"),
+  '/app-error': html("<h2>Application error: a client-side exception has occurred</h2><script>throw new Error('boom')</script>"),
+  '/click-error': html(`<button onclick="throw new Error('handler broke')">Go</button>`),
   // An open side panel over the page, with a backdrop.
   '/panel': html(`${HIT}<main><button onclick="hit('page')">Add adjustment</button></main>
     <div style="position:fixed;inset:0;background:rgba(0,0,0,.4)"></div>
@@ -157,4 +163,29 @@ test('eval runs expressions, statements and function bodies, awaiting promises, 
   ])
   assert.deepEqual(printed(r.out), ['set', '6', 'waited', '2', 'early', '200', '1'], r.out)
   assert.match(r.out, /FAIL eval "window\.n = .*SyntaxError|FAIL eval "window\.n = .*JSON/)
+})
+
+test('open warns, not fails, on page errors when the page loaded and rendered', { skip }, async () => {
+  const r = await uiCheck(['open', '/noisy'])
+  assert.equal(r.code, 0, r.out)
+  assert.match(r.out, /^ok {3}open "\/noisy"/m)
+  assert.match(r.out, /^warn page error: An error occurred in the Server Components render/m)
+  assert.match(r.out, /^warn 503 GET \/api\/flaky/m)
+})
+
+test('page errors still fail on a blank page, an error screen and an action', { skip }, async () => {
+  for (const steps of [['open', '/blank-error'], ['open', '/app-error'], ['open', '/click-error', 'click', 'Go']]) {
+    const r = await uiCheck(steps)
+    assert.equal(r.code, 1, r.out)
+    assert.match(r.out, /^FAIL .*page error: (boom|handler broke)/m)
+  }
+})
+
+test('ignore turns matching errors and responses into info for the rest of the run', { skip }, async () => {
+  const r = await uiCheck(['ignore', 'Server Components', 'ignore', '/api/*', 'open', '/noisy'])
+  assert.equal(r.code, 0, r.out)
+  assert.doesNotMatch(r.out, /^warn/m)
+  assert.match(r.out, /^info ignored: page error: An error occurred/m)
+  assert.match(r.out, /^info ignored: 503 GET \/api\/flaky/m)
+  assert.match(r.out, /0 warnings/)
 })
