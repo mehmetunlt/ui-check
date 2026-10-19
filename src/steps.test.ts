@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { bestCandidate, dialogPolicy, isSelector, lighthouseSummary, lookFails, lookProblems, parseSteps, planWords, resolveUrl, seeVerdict, stepLabel, tokenize } from './steps.ts'
+import { bestCandidate, dialogPolicy, isSelector, lighthouseSummary, lookFails, lookProblems, parseSteps, planWords, rankMatches, resolveUrl, seeVerdict, splitOrdinal, stepLabel, tokenize, type MatchInfo } from './steps.ts'
 
 test('tokenize keeps quoted words whole and stops at a comment', () => {
   assert.deepEqual(tokenize(`fill "Message" 'hi there'  # say hi`), ['fill', 'Message', 'hi there'])
@@ -97,4 +97,35 @@ test('bestCandidate takes the likeliest yes', () => {
 test('stepLabel clips long words', () => {
   assert.equal(stepLabel({ verb: 'press', key: 'Enter' }), 'press Enter')
   assert.match(stepLabel({ verb: 'see', claim: 'x'.repeat(100) }), /^see "x{67}\.\.\."$/)
+})
+
+test('a number after click, hover, fill or select picks that match', () => {
+  assert.deepEqual(parseSteps(['click', 'Payouts', '2', 'hover', 'Menu', 'fill', 'Amount', '50', '3', 'select', 'Size', 'M', 'open', '/x']), [
+    { verb: 'click', target: 'Payouts', nth: 2 }, { verb: 'hover', target: 'Menu' }, { verb: 'fill', target: 'Amount', value: '50', nth: 3 },
+    { verb: 'select', target: 'Size', value: 'M' }, { verb: 'open', target: '/x' },
+  ])
+  assert.equal(stepLabel({ verb: 'click', target: 'Payouts', nth: 2 }), 'click "Payouts" #2')
+  assert.throws(() => parseSteps(['click', 'Payouts', '0']), /unknown step "0"/)
+})
+
+test('splitOrdinal reads "second Payouts", "3rd row" and "last Save"', () => {
+  assert.deepEqual(splitOrdinal('second Payouts'), { nth: 2, rest: 'Payouts' })
+  assert.deepEqual(splitOrdinal('3rd row'), { nth: 3, rest: 'row' })
+  assert.deepEqual(splitOrdinal('Last Save'), { nth: -1, rest: 'Save' })
+  assert.equal(splitOrdinal('Payouts'), null)
+  assert.equal(splitOrdinal('second'), null)
+})
+
+const m = (o: Partial<MatchInfo>): MatchInfo => ({ enabled: true, inViewport: true, topmost: true, inDialog: false, isSubmit: false, inFocusedForm: false, inNav: false, ...o })
+
+test('rankMatches: the dialog, the uncovered, the usable, the submit button, the main content, in that order', () => {
+  assert.deepEqual(rankMatches([m({}), m({ inDialog: true })]), { index: 1, why: 'the one in the dialog' })
+  assert.deepEqual(rankMatches([m({ topmost: false }), m({})]), { index: 1, why: 'the one not covered' })
+  assert.deepEqual(rankMatches([m({ inDialog: true, topmost: false }), m({ inDialog: true })]), { index: 1, why: 'the one in the dialog' })
+  assert.deepEqual(rankMatches([m({ enabled: false }), m({})]), { index: 1, why: 'the enabled one' })
+  assert.deepEqual(rankMatches([m({ inViewport: false, topmost: null }), m({})]), { index: 1, why: 'the one in view' })
+  assert.deepEqual(rankMatches([m({}), m({ isSubmit: true }), m({ isSubmit: true, inFocusedForm: true })]), { index: 2, why: 'the submit button of the focused form' })
+  assert.deepEqual(rankMatches([m({}), m({ isSubmit: true })]), { index: 1, why: 'the submit button' })
+  assert.deepEqual(rankMatches([m({ inNav: true }), m({})]), { index: 1, why: 'the one in the main content' })
+  assert.deepEqual(rankMatches([m({}), m({})]), { index: 0, why: 'the first' })
 })

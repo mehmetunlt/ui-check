@@ -17,13 +17,25 @@ const CHROME = [process.env.CHROME_PATH, '/Applications/Google Chrome.app/Conten
 const skip = CHROME ? false : 'no Chrome'
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-const page = (body: string, head = '') => `<!doctype html><html><head><meta charset="utf-8"><title>t</title>${head}</head><body>${body}</body></html>`
+const page = (body: string, head = '') => `<!doctype html><html><head><meta charset="utf-8"><title>t</title><link rel="icon" href="data:,">${head}</head><body>${body}</body></html>`
 type Handler = (req: IncomingMessage, res: ServerResponse) => void
 const html = (body: string, head?: string): Handler => (_req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(page(body, head)) }
+
+const HIT = '<script>window.hit = (w) => { document.body.dataset.hit = w }</script>'
 
 const ROUTES: Record<string, Handler> = {
   '/a': html('<h1>Page A</h1>'),
   '/b': html('<h1>Page B</h1>'),
+  // The tab heading comes first and is a plain button, as in many component kits.
+  '/login': html(`${HIT}<div><button type="button" onclick="hit('tab')">Login</button><button type="button">Register</button></div>
+    <form onsubmit="hit('submit'); return false"><input aria-label="Email"><button>Login</button></form>`),
+  '/payouts': html(`${HIT}<nav><a href="#p" onclick="hit('nav')">Payouts</a><a href="#e">Earnings</a></nav>
+    <main><div role="tablist"><button role="tab" onclick="hit('tab')">Overview</button><button role="tab" onclick="hit('tab')">Payouts</button></div></main>`),
+  // An open side panel over the page, with a backdrop.
+  '/panel': html(`${HIT}<main><button onclick="hit('page')">Add adjustment</button></main>
+    <div style="position:fixed;inset:0;background:rgba(0,0,0,.4)"></div>
+    <div role="dialog" aria-modal="true" style="position:fixed;top:0;right:0;bottom:0;width:360px;background:#fff">
+      <form onsubmit="hit('panel'); return false"><textarea aria-label="Note"></textarea><button>Add adjustment</button></form></div>`),
 }
 
 let state = ''
@@ -100,4 +112,34 @@ test('two runs of one session take turns on its tab', { skip }, async () => {
   assert.deepEqual(printed(r.out), ['/a'], r.out)
   const next = await uiCheck(['eval', 'location.pathname'], 'three')
   assert.deepEqual(printed(next.out), ['/b'], next.out)
+})
+
+const hitAfter = async (path: string, steps: string[]) => {
+  const r = await uiCheck(['open', path, ...steps, 'eval', 'document.body.dataset.hit'])
+  return { hit: printed(r.out).at(-1), out: r.out }
+}
+
+test('click prefers the submit button over a tab of the same name', { skip }, async () => {
+  const r = await hitAfter('/login', ['fill', 'Email', 'a@b.test', 'click', 'Login'])
+  assert.equal(r.hit, 'submit', r.out)
+  assert.match(r.out, /click "Login" {2}name \(2 matches, chose the submit button of the focused form\)/)
+})
+
+test('click prefers the tab in the page over the sidebar link', { skip }, async () => {
+  const r = await hitAfter('/payouts', ['click', 'Payouts'])
+  assert.equal(r.hit, 'tab', r.out)
+  assert.match(r.out, /2 matches, chose the one in the main content/)
+})
+
+test('click prefers the open panel over the page behind it', { skip }, async () => {
+  const r = await hitAfter('/panel', ['click', 'Add adjustment'])
+  assert.equal(r.hit, 'panel', r.out)
+  assert.match(r.out, /chose the one in the dialog/)
+})
+
+test('an ordinal picks the match, top to bottom', { skip }, async () => {
+  assert.equal((await hitAfter('/payouts', ['click', 'Payouts', '1'])).hit, 'nav')
+  const r = await hitAfter('/payouts', ['click', 'second Payouts'])
+  assert.equal(r.hit, 'tab', r.out)
+  assert.match(r.out, /2 matches, chose #2/)
 })

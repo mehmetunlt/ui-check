@@ -28,7 +28,7 @@ import type { Decisions } from './classifier/types.ts'
 import { fitForLook } from './look-image.ts'
 import {
   LOOK_QUESTIONS, SEE_ID, USAGE, bestCandidate, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
-  resolveUrl, seeQuestion, seeVerdict, stepLabel, type Candidate, type Step,
+  rankMatches, resolveUrl, seeQuestion, seeVerdict, splitOrdinal, stepLabel, type Candidate, type MatchInfo, type Step,
 } from './steps.ts'
 import { acquireLock, activeSessions, callerId, listProcs, lockHolder, projectRoot, readRegistry, sessionKey, staleSessions, writeRegistry } from './session.ts'
 
@@ -306,12 +306,55 @@ async function settle(page: Page): Promise<void> {
   await sleep(250)
 }
 
-async function firstVisible(locs: Locator[]): Promise<Locator | null> {
-  for (const l of locs) {
-    const n = await l.count().catch(() => 0)
-    for (let i = 0; i < Math.min(n, 8); i++) if (await l.nth(i).isVisible().catch(() => false)) return l.nth(i)
+/**
+ * Each element a locator matched, as the ranking sees it (MatchInfo), or null when it is not visible.
+ * A text match counts as the control around it. Page code, kept as a string: no DOM types here.
+ */
+const MATCH_JS = new Function('els', 'fields', `return els.slice(0, 60).map((raw) => {
+  const r = raw.getBoundingClientRect()
+  if (r.width < 1 || r.height < 1 || (raw.checkVisibility && !raw.checkVisibility({ opacityProperty: true, visibilityProperty: true }))) return null
+  const el = fields ? raw : (raw.closest('button, a[href], [role=button], [role=link], [role=tab], [role=menuitem], [role=option], [role=checkbox], [role=radio], [role=switch], summary, label, input') || raw)
+  const inViewport = r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth
+  let topmost = null
+  if (inViewport) {
+    const x = Math.min(Math.max(r.left + r.width / 2, 0), innerWidth - 1), y = Math.min(Math.max(r.top + r.height / 2, 0), innerHeight - 1)
+    const root = raw.getRootNode()
+    const at = (root.elementFromPoint ? root : document).elementFromPoint(x, y)
+    topmost = !!at && (raw.contains(at) || el.contains(at) || (at.tagName === 'LABEL' && at.control === raw))
   }
-  return null
+  let dialog = !!el.closest('[role=dialog], [role=alertdialog], dialog[open], [aria-modal=true]')
+  for (let a = el.parentElement; !dialog && a && a !== document.body; a = a.parentElement) {
+    if (typeof a.className === 'string' && /drawer|modal|dialog|offcanvas|sheet/i.test(a.className) && getComputedStyle(a).position === 'fixed') dialog = true
+  }
+  const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true' || !!el.closest('[inert]') || (fields && raw.readOnly === true)
+  const form = el.form || el.closest('form')
+  const isSubmit = !!form && ((el.tagName === 'BUTTON' && el.type === 'submit') || (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'image')))
+  const act = document.activeElement
+  return {
+    enabled: !disabled, inViewport, topmost, inDialog: dialog, isSubmit,
+    inFocusedForm: !!form && !!act && act !== document.body && form.contains(act),
+    inNav: !dialog && !!el.closest('nav, aside, header, footer, [role=navigation], [role=banner], [role=complementary], [role=contentinfo]'),
+  }
+})`) as (els: unknown[], fields: boolean) => (MatchInfo | null)[]
+
+type Hit = { loc: Locator; how: string }
+
+/**
+ * The match a step means, among the visible elements one locator matches: the Nth (top to bottom)
+ * when an ordinal is given, else the ranking's pick. Null when none is visible.
+ */
+async function choose(loc: Locator, how: string, fields: boolean, nth?: number): Promise<Hit | null> {
+  const infos = await loc.evaluateAll(MATCH_JS, fields).catch(() => [] as (MatchInfo | null)[])
+  const shown = infos.flatMap((m, i) => (m ? [{ i, m }] : []))
+  if (shown.length === 0) return null
+  if (nth !== undefined) {
+    const pick = nth === -1 ? shown.at(-1) : shown[nth - 1]
+    if (!pick) throw new Error(`only ${shown.length} ${shown.length === 1 ? 'match' : 'matches'}, no #${nth}`)
+    return { loc: loc.nth(pick.i), how: shown.length > 1 ? `${how} (${shown.length} matches, chose #${nth === -1 ? shown.length : nth})` : how }
+  }
+  if (shown.length === 1) return { loc: loc.nth(shown[0]!.i), how }
+  const r = rankMatches(shown.map((x) => x.m))
+  return { loc: loc.nth(shown[r.index]!.i), how: `${how} (${shown.length} matches, chose ${r.why})` }
 }
 
 /**
@@ -346,21 +389,37 @@ async function candidates(page: Page, fields: boolean): Promise<Candidate[]> {
   return page.evaluate<Candidate[]>(`(${CANDIDATES_JS})(${fields})`)
 }
 
-/** The element words name: selector, role and name, label, text; then the classifier's pick. */
-async function find(page: Page, verb: 'click' | 'hover' | 'fill' | 'select', target: string): Promise<{ loc: Locator; how: string } | null> {
-  if (isSelector(target)) {
-    const loc = await firstVisible([page.locator(target)])
-    return loc ? { loc, how: 'selector' } : null
-  }
+/** The locators that name an element, best first: exact name, then looser names and text. */
+function tiers(page: Page, target: string, fields: boolean): Array<[Locator, string]> {
+  const any = (locs: Locator[]) => locs.reduce((a, b) => a.or(b))
+  return fields
+    ? [
+        [any([page.getByLabel(target, { exact: true }), page.getByPlaceholder(target, { exact: true }), ...FIELD_ROLES.map((r) => page.getByRole(r, { name: target, exact: true }))]), 'name'],
+        [any([page.getByLabel(target), page.getByPlaceholder(target), ...FIELD_ROLES.map((r) => page.getByRole(r, { name: target }))]), 'text'],
+      ]
+    : [
+        [any(CLICK_ROLES.map((r) => page.getByRole(r, { name: target, exact: true }))), 'name'],
+        [any(CLICK_ROLES.map((r) => page.getByRole(r, { name: target }))), 'text'],
+        [page.getByText(target, { exact: true }), 'text'],
+        [page.getByText(target), 'text'],
+      ]
+}
+
+/** The element words name: selector, role and name, label, text, "second TEXT"; then the classifier's pick. */
+async function find(page: Page, verb: 'click' | 'hover' | 'fill' | 'select', target: string, nth?: number): Promise<Hit | null> {
   const fields = verb === 'fill' || verb === 'select'
-  const exact = await firstVisible(fields
-    ? [page.getByLabel(target, { exact: true }), page.getByPlaceholder(target, { exact: true }), ...FIELD_ROLES.map((r) => page.getByRole(r, { name: target, exact: true }))]
-    : CLICK_ROLES.map((r) => page.getByRole(r, { name: target, exact: true })))
-  if (exact) return { loc: exact, how: 'name' }
-  const loose = await firstVisible(fields
-    ? [page.getByLabel(target), page.getByPlaceholder(target), ...FIELD_ROLES.map((r) => page.getByRole(r, { name: target }))]
-    : [...CLICK_ROLES.map((r) => page.getByRole(r, { name: target })), page.getByText(target, { exact: true }), page.getByText(target)])
-  if (loose) return { loc: loose, how: 'text' }
+  if (isSelector(target)) return choose(page.locator(target), 'selector', fields, nth)
+  for (const [loc, how] of tiers(page, target, fields)) {
+    const hit = await choose(loc, how, fields, nth)
+    if (hit) return hit
+  }
+  const ord = nth === undefined ? splitOrdinal(target) : null
+  if (ord) {
+    for (const [loc, how] of tiers(page, ord.rest, fields)) {
+      const hit = await choose(loc, how, fields, ord.nth)
+      if (hit) return hit
+    }
+  }
   const cands = await candidates(page, fields)
   if (cands.length === 0) return null
   const answers = await ask({ questions: [pickQuestion(verb, target)], items: cands.map((c) => ({ id: String(c.idx), text: candidateText(c) })) })
@@ -383,7 +442,7 @@ async function run(page: Page, s: Step): Promise<Outcome> {
       return { ok: status < 400, note: `${status || 'no response'} ${page.url()}` }
     }
     case 'click': case 'hover': {
-      const hit = await find(page, s.verb, s.target)
+      const hit = await find(page, s.verb, s.target, s.nth)
       if (!hit) return { ok: false, note: 'nothing matches' }
       if (s.verb === 'click') await hit.loc.click({ timeout: 8_000 })
       else await hit.loc.hover({ timeout: 8_000 })
@@ -391,7 +450,7 @@ async function run(page: Page, s: Step): Promise<Outcome> {
       return { ok: true, note: hit.how }
     }
     case 'fill': case 'select': {
-      const hit = await find(page, s.verb, s.target)
+      const hit = await find(page, s.verb, s.target, s.nth)
       if (!hit) return { ok: false, note: 'no such field' }
       if (s.verb === 'fill') await hit.loc.fill(s.value, { timeout: 8_000 })
       else await hit.loc.selectOption({ label: s.value }, { timeout: 8_000 })

@@ -28,6 +28,7 @@ Run `ui-check --help` for the whole list. The main steps:
 
 - `open PATH|URL`: PATH is joined to `--base` (or `UI_CHECK_BASE`; default `http://localhost:5173`). Always pass `--base` outside agents-system.
 - `click TEXT`, `hover TEXT`, `fill FIELD VALUE`, `select FIELD OPTION`: by accessible name, label, placeholder or text first; `css=…` or `role=…` selectors pass through. When nothing matches, the classifier picks the visible control the words describe, so `click "the send button"` or `fill "the search box" x` works on icon-only buttons and unlabeled fields. The line says how it matched (`name`, `text`, `picked "Send" p 0.92`).
+- When several elements match, the one in an open dialog or drawer wins, then one not covered by an overlay, enabled and in view, then the focused form's submit button, then one outside the nav or sidebar. The line says so: `name (2 matches, chose the one in the dialog)`. To pick one yourself, put a number after the step (`click Payouts 2`, `fill Amount 50 2`: the Nth match top to bottom) or an ordinal in the words (`click 'second Payouts'`, `click 'last Delete'`).
 - `see CLAIM` / `nosee CLAIM`: the classifier checks the screenshot (and visible text) for CLAIM; prints `p`; fails when wrong. Write claims about what a person would see: `see "the thread shows a reply from the agent"`.
 - `look`: health check of the screen: an error screen fails; blank, stuck loading or broken layout warn.
 - `wait SECONDS|TEXT`, `press KEY`, `scroll down|up|TEXT`, `phone`, `desktop`, `dark`, `light`, `back`, `reload`.

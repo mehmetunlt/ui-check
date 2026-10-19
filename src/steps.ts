@@ -6,8 +6,9 @@ import type { QuickQuestion } from './classifier/quick-check.ts'
 
 export type Step =
   | { verb: 'open'; target: string }
-  | { verb: 'click' | 'hover'; target: string }
-  | { verb: 'fill' | 'select' | 'drag' | 'upload'; target: string; value: string }
+  | { verb: 'click' | 'hover'; target: string; nth?: number }
+  | { verb: 'fill' | 'select'; target: string; value: string; nth?: number }
+  | { verb: 'drag' | 'upload'; target: string; value: string }
   | { verb: 'dialog'; answer: string }
   | { verb: 'trace'; action: 'start' | 'stop' }
   | { verb: 'press'; key: string }
@@ -29,11 +30,14 @@ export const VERB_ARITY: Record<Step['verb'], number> = {
 
 export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--close] <steps…>
   open PATH|URL        go to a page (PATH is joined to --base, default http://localhost:5173)
-  click TEXT           a button, link, tab or menu item by its name or text; css=… or role=… work too;
-                       when nothing matches, the classifier picks the control TEXT describes
-  hover TEXT           as click, without clicking
-  fill FIELD VALUE     a field by label, placeholder or name (classifier fallback as for click)
-  select FIELD OPTION  pick an option in a select
+  click TEXT [N]       a button, link, tab or menu item by its name or text; css=… or role=… work too;
+                       when nothing matches, the classifier picks the control TEXT describes. When several
+                       match, the one in an open dialog wins, then one not covered, enabled and in view, then
+                       the focused form's submit button, then one outside the nav; the line says which.
+                       N (or "second TEXT", "last TEXT") picks the Nth match, top to bottom; fill and select take N too
+  hover TEXT [N]       as click, without clicking
+  fill FIELD VALUE [N] a field by label, placeholder or name (classifier fallback as for click)
+  select FIELD OPTION [N]  pick an option in a select
   press KEY            Enter, Escape, Tab, Meta+k…
   drag FROM TO         drag one element onto another (each found as click finds it, or by its text)
   upload TARGET FILE   a file into the file field TARGET names, or through the picker the control TARGET opens;
@@ -116,9 +120,15 @@ export function parseSteps(words: readonly string[]): Step[] {
     const args = words.slice(i + 1, i + 1 + arity)
     if (args.length < arity) throw new Error(`"${verb}" needs ${arity} ${arity === 1 ? 'word' : 'words'} after it`)
     i += 1 + arity
+    // An optional number after a click, hover, fill or select picks the Nth match (no step is a number).
+    let nth: number | undefined
+    if ((verb === 'click' || verb === 'hover' || verb === 'fill' || verb === 'select') && /^[1-9]\d*$/.test(words[i] ?? '')) nth = Number(words[i++])
+    const withNth = nth === undefined ? {} : { nth }
     switch (verb) {
-      case 'open': case 'scroll': case 'click': case 'hover': steps.push({ verb, target: args[0]! }); break
-      case 'fill': case 'select': case 'drag': case 'upload': steps.push({ verb, target: args[0]!, value: args[1]! }); break
+      case 'click': case 'hover': steps.push({ verb, target: args[0]!, ...withNth }); break
+      case 'fill': case 'select': steps.push({ verb, target: args[0]!, value: args[1]!, ...withNth }); break
+      case 'open': case 'scroll': steps.push({ verb, target: args[0]! }); break
+      case 'drag': case 'upload': steps.push({ verb, target: args[0]!, value: args[1]! }); break
       case 'dialog': steps.push({ verb, answer: args[0]! }); break
       case 'trace':
         if (args[0] !== 'start' && args[0] !== 'stop') throw new Error('"trace" takes start or stop')
@@ -152,9 +162,10 @@ export function isSelector(target: string): boolean {
 
 export function stepLabel(s: Step): string {
   const q = (v: string) => JSON.stringify(v.length > 70 ? `${v.slice(0, 67)}...` : v)
+  const n = 'nth' in s && s.nth !== undefined ? ` #${s.nth}` : ''
   switch (s.verb) {
-    case 'open': case 'click': case 'hover': case 'scroll': return `${s.verb} ${q(s.target)}`
-    case 'fill': case 'select': case 'drag': case 'upload': return `${s.verb} ${q(s.target)} ${q(s.value)}`
+    case 'open': case 'click': case 'hover': case 'scroll': return `${s.verb} ${q(s.target)}${n}`
+    case 'fill': case 'select': case 'drag': case 'upload': return `${s.verb} ${q(s.target)} ${q(s.value)}${n}`
     case 'dialog': return `dialog ${q(s.answer)}`
     case 'trace': return `trace ${s.action}`
     case 'press': return `press ${s.key}`
@@ -164,6 +175,47 @@ export function stepLabel(s: Step): string {
     case 'network': case 'response': return `${s.verb} ${q(s.filter)}`
     default: return s.verb
   }
+}
+
+const ORDINALS: Record<string, number> = { first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10, last: -1 }
+
+/** "second Payouts" into 2 and "Payouts"; "3rd row", "last Save" (-1) too. Null when there is no ordinal. */
+export function splitOrdinal(target: string): { nth: number; rest: string } | null {
+  const m = /^(\w+)\s+(\S.*)$/.exec(target.trim())
+  if (!m) return null
+  const w = m[1]!.toLowerCase()
+  const nth = ORDINALS[w] ?? (/^([1-9]\d*)(st|nd|rd|th)$/.test(w) ? parseInt(w, 10) : undefined)
+  return nth === undefined ? null : { nth, rest: m[2]! }
+}
+
+/** What the page says about one visible match of a click or fill target. topmost: null when it is out of view. */
+export type MatchInfo = {
+  enabled: boolean; inViewport: boolean; topmost: boolean | null; inDialog: boolean
+  isSubmit: boolean; inFocusedForm: boolean; inNav: boolean
+}
+
+const PREFER: ReadonlyArray<[string, (m: MatchInfo) => boolean]> = [
+  ['the one in the dialog', (m) => m.inDialog && m.topmost !== false],
+  ['the one not covered', (m) => m.topmost !== false],
+  ['the enabled one', (m) => m.enabled],
+  ['the one in view', (m) => m.inViewport],
+  ['the submit button of the focused form', (m) => m.isSubmit && m.inFocusedForm],
+  ['the submit button', (m) => m.isSubmit],
+  ['the one in the main content', (m) => !m.inNav],
+]
+
+/**
+ * Which of several matches a person means: each preference in turn narrows the field when some
+ * but not all of them have it; the first left (in page order) wins. `why` is the first that decided.
+ */
+export function rankMatches(ms: readonly MatchInfo[]): { index: number; why: string } {
+  let left = ms.map((_, i) => i)
+  let why = ''
+  for (const [reason, ok] of PREFER) {
+    const keep = left.filter((i) => ok(ms[i]!))
+    if (keep.length && keep.length < left.length) { left = keep; why ||= reason }
+  }
+  return { index: left[0] ?? 0, why: why || 'the first' }
 }
 
 export const SEE_ID = 'claim'
