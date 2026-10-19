@@ -75,8 +75,10 @@ const tabLock = (m: Mode, key: string) => join(STATE_DIR, 'locks', `${m.headless
 const tabLocked = (m: Mode) => (key: string) => lockHolder(tabLock(m, key)) !== null
 
 if (close && words.length === 0) {
-  stopUnlessShared(MODES.shown)
-  stopUnlessShared(MODES.hidden)
+  for (const m of [MODES.shown, MODES.hidden]) {
+    const tab = existsSync(m.pidFile) && activeSessions(readRegistry(m.sessions), SESSION, Date.now(), tabLocked(m)).length ? await closeOwnTab(m) : false
+    stopUnlessShared(m, tab)
+  }
   process.exit(0)
 }
 const mode = show ? MODES.shown : MODES.hidden
@@ -116,13 +118,22 @@ function stopChrome(m: Mode): void {
 }
 
 /** --close: Chrome stops unless other sessions are using it (a run going, or one in the last minutes). */
-function stopUnlessShared(m: Mode): boolean {
+function stopUnlessShared(m: Mode, closedTab: boolean): void {
   const others = activeSessions(readRegistry(m.sessions), SESSION, Date.now(), tabLocked(m))
   if (others.length && existsSync(m.pidFile)) {
-    console.log(`left the ${m.headless ? 'hidden' : 'visible'} ui-check Chrome running: ${others.length} other ${others.length === 1 ? 'session uses' : 'sessions use'} it`)
-    return false
-  }
-  stopChrome(m)
+    console.log(`${closedTab ? "closed this session's tab; " : ''}left the ${m.headless ? 'hidden' : 'visible'} ui-check Chrome running: ${others.length} other ${others.length === 1 ? 'session uses' : 'sessions use'} it`)
+  } else stopChrome(m)
+}
+
+/** --close on its own, while other sessions keep Chrome: just this session's tab goes. */
+async function closeOwnTab(m: Mode): Promise<boolean> {
+  const entry = readRegistry(m.sessions)[SESSION]
+  if (!entry) return false
+  try {
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${m.port}`, { timeout: 5_000 })
+    for (const p of browser.contexts()[0]?.pages() ?? []) if ((await targetId(p).catch(() => '')) === entry.target) await p.close().catch(() => {})
+  } catch {}
+  await forgetSession(m)
   return true
 }
 
@@ -151,12 +162,12 @@ async function sessionPage(browser: Browser): Promise<Page> {
   } finally { release() }
 }
 
-async function forgetSession(): Promise<void> {
-  const release = await acquireLock(`${mode.sessions}.lock`, 15_000)
+async function forgetSession(m: Mode): Promise<void> {
+  const release = await acquireLock(`${m.sessions}.lock`, 15_000)
   try {
-    const reg = readRegistry(mode.sessions)
+    const reg = readRegistry(m.sessions)
     delete reg[SESSION]
-    writeRegistry(mode.sessions, reg)
+    writeRegistry(m.sessions, reg)
   } finally { release() }
 }
 
@@ -856,8 +867,8 @@ async function main(): Promise<void> {
   console.log(`\n${steps.length} steps, ${failures} failed, ${warnings} warnings, ${calls} classifier calls ($${(costMicroUsd / 1e6).toFixed(4)}), ${secs} s`)
   if (close) {
     await page.close().catch(() => {})
-    await forgetSession()
-    if (!stopUnlessShared(mode)) console.log("info closed this session's tab")
+    await forgetSession(mode)
+    stopUnlessShared(mode, true)
   }
 }
 

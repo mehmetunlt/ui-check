@@ -122,11 +122,11 @@ after(async () => {
 })
 
 /** One ui-check run from source; resolves with its exit code and output. */
-function uiCheck(args: string[], session = 'test'): Promise<{ code: number | null; out: string }> {
+function uiCheck(args: string[], session = 'test', own?: { state: string; port: number }): Promise<{ code: number | null; out: string }> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ['--import', 'tsx', 'src/main.ts', '--base', base, ...args], {
       cwd: REPO,
-      env: { ...process.env, UI_CHECK_STATE: state, UI_CHECK_PORT: String(port), UI_CHECK_SESSION: session, OPENROUTER_API_KEY: '' },
+      env: { ...process.env, UI_CHECK_STATE: own?.state ?? state, UI_CHECK_PORT: String(own?.port ?? port), UI_CHECK_SESSION: session, OPENROUTER_API_KEY: '' },
     })
     let out = ''
     child.stdout.on('data', (d) => { out += d })
@@ -286,4 +286,23 @@ test('settleForLook waits for the page to stop changing, at most its bound', { s
     await settleForLook(p)
     assert.equal(await p.textContent('h1'), 'Loaded')
   } finally { await browser.close() }
+})
+
+test('--close closes only this session tab while another session uses Chrome, and stops it after the last', { skip }, async () => {
+  const own = { state: mkdtempSync(join(tmpdir(), 'ui-check-close-')), port: await freePort() }
+  try {
+    await uiCheck(['open', '/a'], 'keep', own)
+    await uiCheck(['open', '/b'], 'leave', own)
+    const leave = await uiCheck(['--close'], 'leave', own)
+    assert.match(leave.out, /closed this session's tab; left the hidden ui-check Chrome running: 1 other session uses it/, leave.out)
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(own.state, 'sessions-hidden.json'), 'utf8'))).length, 1)
+    const keep = await uiCheck(['eval', 'location.pathname', '--close'], 'keep', own)
+    assert.deepEqual(printed(keep.out), ['/a'], keep.out)
+    assert.match(keep.out, /stopped the hidden ui-check Chrome/, keep.out)
+  } finally {
+    const pidFile = join(own.state, 'chrome-hidden.pid')
+    if (existsSync(pidFile)) try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGTERM') } catch {}
+    await sleep(500)
+    rmSync(own.state, { recursive: true, force: true, maxRetries: 5 })
+  }
 })
