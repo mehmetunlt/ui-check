@@ -53,7 +53,8 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
   dark | light         colour scheme
   read                 print the page's visible text (first 2,000 characters)
   shot                 save a screenshot and print its path
-  eval JS              run JS in the page and print the result
+  eval JS              run JS in the page and print the result: an expression, or statements as in the DevTools
+                       console (the last one's value, or a top-level return's); promises are awaited
   console              every console message and page error of this run, all levels
   network FILTER       this run's requests (method, status, time, type, URL): FILTER is part of the URL,
                        a type (fetch, xhr, document, script…) or a status (404, failed); "" for all

@@ -430,6 +430,31 @@ async function find(page: Page, verb: 'click' | 'hover' | 'fill' | 'select', tar
   return { loc, how: `picked "${(c?.name || c?.tag || '').slice(0, 50)}" p ${best.p.toFixed(2)}` }
 }
 
+const AsyncFunction = (async () => {}).constructor as new (...args: string[]) => unknown
+
+/**
+ * eval: an expression is awaited as before. Statements run the way the DevTools console runs them
+ * (REPL mode: top-level await, the last statement's value), and a body with a top-level return runs
+ * as a function body. The script is parsed here first, so it runs once even when it throws.
+ */
+async function evaluate(page: Page, script: string): Promise<unknown> {
+  try {
+    new AsyncFunction(`return (${script}\n)`)
+    return await page.evaluate(`(async () => (${script}\n))()`)
+  } catch (e) {
+    if (!(e instanceof SyntaxError)) throw e
+  }
+  const cdp = await page.context().newCDPSession(page)
+  try {
+    const r = await cdp.send('Runtime.evaluate', { expression: script, replMode: true, awaitPromise: true, returnByValue: true, userGesture: true })
+    const ex = r.exceptionDetails
+    if (!ex) return r.result.value
+    const msg = ex.exception?.description ?? ex.text
+    if (!/^SyntaxError: Illegal return statement/.test(msg)) throw new Error(msg.split('\n')[0])
+  } finally { await cdp.detach().catch(() => {}) }
+  return page.evaluate(`(async () => {\n${script}\n})()`)
+}
+
 // ── steps ────────────────────────────────────────────────────────────────────
 type Outcome = { ok: boolean; note?: string; print?: string }
 
@@ -571,7 +596,7 @@ async function run(page: Page, s: Step): Promise<Outcome> {
     case 'shot': return { ok: true, note: await saveShot(page, 'shot') }
     case 'read': return { ok: true, print: (await visibleText(page)).slice(0, 2_000) }
     case 'eval': {
-      const v = await page.evaluate(`(async () => (${s.script}))()`)
+      const v = await evaluate(page, s.script)
       return { ok: true, print: typeof v === 'string' ? v : JSON.stringify(v) }
     }
     case 'console':

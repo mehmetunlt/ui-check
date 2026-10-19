@@ -35,7 +35,7 @@ Run `ui-check --help` for the whole list. The main steps:
 - `drag FROM TO`: drags one element onto another (HTML5 drag and drop works); each is found as `click` finds it, or by its text.
 - `upload TARGET FILE`: into the file field TARGET names, or through the picker the control TARGET opens (a hidden input works); falls back to the page's first file input.
 - `dialog accept|dismiss|TEXT`: how alert, confirm and prompt dialogs are answered from that step on (TEXT answers a prompt). Without it every dialog is dismissed, so a "Delete everything?" confirm never goes through by accident. Each dialog prints an `info` line.
-- `read` prints the visible text (2,000 characters); `eval JS` prints a value; `shot` saves a screenshot and prints its path.
+- `read` prints the visible text (2,000 characters); `eval JS` prints a value (an expression, or statements like `document.cookie='a=b'; 'set'` as the DevTools console runs them: the last statement's value, or a top-level `return`; promises are awaited); `shot` saves a screenshot and prints its path.
 - Inspecting, like the browser devtools (all of it from the current run, so put these steps after the actions they are about):
   - `console`: every console message and page error, all levels.
   - `network FILTER`: requests with method, status, time and type; FILTER is part of the URL, a type (`fetch`, `xhr`, `document`) or a status (`404`, `failed`); `""` for all.

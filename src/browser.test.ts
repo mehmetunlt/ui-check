@@ -143,3 +143,18 @@ test('an ordinal picks the match, top to bottom', { skip }, async () => {
   assert.equal(r.hit, 'tab', r.out)
   assert.match(r.out, /2 matches, chose #2/)
 })
+
+test('eval runs expressions, statements and function bodies, awaiting promises, each once', { skip }, async () => {
+  const r = await uiCheck(['open', '/a',
+    'eval', "document.cookie='a=b; path=/'; 'set'",
+    'eval', 'const x = 2; x * 3',
+    'eval', "await new Promise((r) => setTimeout(r, 50)); 'waited'",
+    'eval', 'const r = [1, 2].map((x) => { return x * 2 }); r.length',
+    'eval', "if (document.title) { return 'early' } return 'late'",
+    'eval', "fetch('/a').then((r) => r.status)",
+    'eval', "window.n = (window.n || 0) + 1; JSON.parse('{')",
+    'eval', 'window.n',
+  ])
+  assert.deepEqual(printed(r.out), ['set', '6', 'waited', '2', 'early', '200', '1'], r.out)
+  assert.match(r.out, /FAIL eval "window\.n = .*SyntaxError|FAIL eval "window\.n = .*JSON/)
+})
