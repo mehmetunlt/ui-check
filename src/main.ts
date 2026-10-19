@@ -29,7 +29,7 @@ import type { Decisions } from './classifier/types.ts'
 import { fitForLook } from './look-image.ts'
 import { settleForLook, trackRequests } from './settle.ts'
 import {
-  LOOK_QUESTIONS, SEE_ID, USAGE, bestCandidate, devOverlayStyle, ignoredBy, judgeWithRetry, pageErrorsFail, tidyText, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
+  LOOK_QUESTIONS, NEXT_DEV_SELECTORS, SEE_ID, USAGE, bestCandidate, devOverlayStyle, ignoredBy, judgeWithRetry, pageErrorsFail, tidyText, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
   rankMatches, resolveUrl, seeQuestion, seeVerdict, splitOrdinal, stepLabel, type Candidate, type MatchInfo, type Step,
 } from './steps.ts'
 import { acquireLock, activeSessions, callerId, listProcs, lockHolder, projectRoot, readRegistry, sessionKey, staleSessions, writeRegistry } from './session.ts'
@@ -305,6 +305,7 @@ async function screenshot(page: Page, style?: string): Promise<Uint8Array> {
 }
 
 const DEV_OVERLAYS_JS = `({
+  nextPresent: !!document.querySelector(${JSON.stringify(NEXT_DEV_SELECTORS.join(', '))}),
   nextDialog: [...document.querySelectorAll('nextjs-portal')].some((h) => !!h.shadowRoot && !!h.shadowRoot.querySelector('[data-nextjs-dialog], [data-nextjs-dialog-overlay]')),
   viteOverlay: !!document.querySelector('vite-error-overlay'),
 })`
@@ -324,7 +325,7 @@ async function visibleText(page: Page): Promise<string> {
 
 /** The screenshot (dev overlays hidden) and the visible text, asked the questions in one call. */
 async function judge(page: Page, questions: readonly QuickQuestion[]) {
-  const overlays = await page.evaluate<{ nextDialog: boolean; viteOverlay: boolean }>(DEV_OVERLAYS_JS).catch(() => ({ nextDialog: false, viteOverlay: false }))
+  const overlays = await page.evaluate<{ nextPresent: boolean; nextDialog: boolean; viteOverlay: boolean }>(DEV_OVERLAYS_JS).catch(() => ({ nextPresent: true, nextDialog: false, viteOverlay: false }))
   const style = devOverlayStyle({ ...overlays, sawErrors: consoleLog.some((l) => l.startsWith('[error]') || l.startsWith('[pageerror]')) })
   const [png, text] = await Promise.all([screenshot(page, style), visibleText(page)])
   const jpg = await fitForLook(png, { maxAspect: 2.5 })

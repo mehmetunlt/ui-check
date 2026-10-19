@@ -168,6 +168,9 @@ test('dev overlays are hidden for the look unless they show an error', () => {
   assert.equal(devOverlayStyle({ nextDialog: true, viteOverlay: false, sawErrors: true }), '')
   assert.match(devOverlayStyle({ nextDialog: false, viteOverlay: true, sawErrors: false }), /vite-error-overlay/)
   assert.doesNotMatch(devOverlayStyle({ nextDialog: false, viteOverlay: true, sawErrors: true }), /vite-error-overlay/)
+  // No dev indicator and no overlay on the page: no style at all (a site's CSP never logs one for the check).
+  assert.equal(devOverlayStyle({ nextPresent: false, nextDialog: false, viteOverlay: false, sawErrors: false }), '')
+  assert.match(devOverlayStyle({ nextPresent: true, nextDialog: false, viteOverlay: false, sawErrors: false }), /^nextjs-portal/)
 })
 
 test('a failed see is asked again once, after the page settles', async () => {

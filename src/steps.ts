@@ -323,12 +323,17 @@ export function tidyText(text: string, max = 4_000): string {
   return nl > max * 0.8 ? cut.slice(0, nl) : cut
 }
 
+/** The Next.js dev indicator and build badge, as the judged screenshot hides them. */
+export const NEXT_DEV_SELECTORS = ['nextjs-portal', '#__next-build-watcher', '#__next-prerender-indicator', '[data-nextjs-toast]', '[data-next-badge-root]'] as const
+
 /**
  * CSS for the judged screenshot: the Next.js dev indicator and build badge are hidden unless its error
- * dialog is open, and Vite's error overlay only when this run saw no error (a stale one).
+ * dialog is open, and Vite's error overlay only when this run saw no error (a stale one). Only what is on the
+ * page: on a page with none of them the style is empty and none is added, so a site's Content Security
+ * Policy never logs a blocked inline style for the check itself (`nextPresent` left out counts as present).
  */
-export function devOverlayStyle(o: { nextDialog: boolean; viteOverlay: boolean; sawErrors: boolean }): string {
-  const hide = o.nextDialog ? [] : ['nextjs-portal', '#__next-build-watcher', '#__next-prerender-indicator', '[data-nextjs-toast]', '[data-next-badge-root]']
+export function devOverlayStyle(o: { nextDialog: boolean; viteOverlay: boolean; sawErrors: boolean; nextPresent?: boolean }): string {
+  const hide: string[] = o.nextDialog || o.nextPresent === false ? [] : [...NEXT_DEV_SELECTORS]
   if (o.viteOverlay && !o.sawErrors) hide.push('vite-error-overlay')
   return hide.length ? `${hide.join(', ')} { display: none !important; }` : ''
 }
