@@ -27,8 +27,9 @@ import { createDecisions } from './classifier/client.ts'
 import { quickCheck, type QuickQuestion } from './classifier/quick-check.ts'
 import type { Decisions } from './classifier/types.ts'
 import { fitForLook } from './look-image.ts'
+import { settleForLook } from './settle.ts'
 import {
-  LOOK_QUESTIONS, SEE_ID, USAGE, bestCandidate, ignoredBy, pageErrorsFail, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
+  LOOK_QUESTIONS, SEE_ID, USAGE, bestCandidate, devOverlayStyle, ignoredBy, judgeWithRetry, pageErrorsFail, tidyText, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
   rankMatches, resolveUrl, seeQuestion, seeVerdict, splitOrdinal, stepLabel, type Candidate, type MatchInfo, type Step,
 } from './steps.ts'
 import { acquireLock, activeSessions, callerId, listProcs, lockHolder, projectRoot, readRegistry, sessionKey, staleSessions, writeRegistry } from './session.ts'
@@ -288,9 +289,14 @@ async function ask(input: Parameters<typeof quickCheck>[1]) {
 // finite CSS animations by firing animationend, and apps react to that: a
 // react-toastify toast closes when its progress bar animation ends, so every
 // `see` dismissed the toast it was asked about.
-async function screenshot(page: Page): Promise<Uint8Array> {
-  return new Uint8Array(await page.screenshot({ type: 'png', caret: 'hide' }))
+async function screenshot(page: Page, style?: string): Promise<Uint8Array> {
+  return new Uint8Array(await page.screenshot({ type: 'png', caret: 'hide', ...(style ? { style } : {}) }))
 }
+
+const DEV_OVERLAYS_JS = `({
+  nextDialog: [...document.querySelectorAll('nextjs-portal')].some((h) => !!h.shadowRoot && !!h.shadowRoot.querySelector('[data-nextjs-dialog], [data-nextjs-dialog-overlay]')),
+  viteOverlay: !!document.querySelector('vite-error-overlay'),
+})`
 
 async function saveShot(page: Page, why: string): Promise<string> {
   mkdirSync(SHOTS, { recursive: true })
@@ -300,14 +306,18 @@ async function saveShot(page: Page, why: string): Promise<string> {
 }
 
 async function visibleText(page: Page): Promise<string> {
-  return page.evaluate<string>(`(document.body ? document.body.innerText : '').replace(/\\n{3,}/g, '\\n\\n')`).catch(() => '')
+  const read = () => page.evaluate<string>(`document.body ? document.body.innerText : ''`)
+  // A navigation in flight destroys the context the first read ran in.
+  return read().catch(() => sleep(300).then(read)).catch(() => '')
 }
 
-/** The screenshot and visible text, asked the questions in one call. */
+/** The screenshot (dev overlays hidden) and the visible text, asked the questions in one call. */
 async function judge(page: Page, questions: readonly QuickQuestion[]) {
-  const [png, text] = await Promise.all([screenshot(page), visibleText(page)])
+  const overlays = await page.evaluate<{ nextDialog: boolean; viteOverlay: boolean }>(DEV_OVERLAYS_JS).catch(() => ({ nextDialog: false, viteOverlay: false }))
+  const style = devOverlayStyle({ ...overlays, sawErrors: consoleLog.some((l) => l.startsWith('[error]') || l.startsWith('[pageerror]')) })
+  const [png, text] = await Promise.all([screenshot(page, style), visibleText(page)])
   const jpg = await fitForLook(png, { maxAspect: 2.5 })
-  return ask({ questions, material: text.slice(0, TEXT_CHARS), images: [{ format: 'jpg', data: jpg }] })
+  return ask({ questions, material: tidyText(text, TEXT_CHARS), images: [{ format: 'jpg', data: jpg }] })
 }
 
 async function settle(page: Page): Promise<void> {
@@ -676,12 +686,14 @@ async function run(page: Page, s: Step): Promise<Outcome> {
       catch { return { ok: false, note: 'not shown after 15 s' } }
     case 'see': case 'nosee': {
       if (!classifier()) return { ok: false, note: 'OPENROUTER_API_KEY is not set' }
-      const answers = await judge(page, [seeQuestion(s.claim)])
-      const v = seeVerdict(s.verb, answers?.find((a) => a.id === SEE_ID)?.p ?? null)
+      await settleForLook(page)
+      const once = async () => (await judge(page, [seeQuestion(s.claim)]))?.find((a) => a.id === SEE_ID)?.p ?? null
+      const v = await judgeWithRetry(s.verb, once, async () => { await sleep(500); await settleForLook(page) })
       return { ok: v.ok, note: v.note }
     }
     case 'look': {
       if (!classifier()) return { ok: true, note: 'skipped: OPENROUTER_API_KEY is not set' }
+      await settleForLook(page)
       const answers = await judge(page, LOOK_QUESTIONS)
       if (!answers || answers.every((a) => a.p === null)) return { ok: true, note: 'no answer from the classifier' }
       const problems = lookProblems(answers)

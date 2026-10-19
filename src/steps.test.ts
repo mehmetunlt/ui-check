@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { bestCandidate, ignoredBy, pageErrorsFail, dialogPolicy, isSelector, lighthouseSummary, lookFails, lookProblems, parseSteps, planWords, rankMatches, resolveUrl, seeVerdict, splitOrdinal, stepLabel, tokenize, type MatchInfo } from './steps.ts'
+import { bestCandidate, devOverlayStyle, judgeWithRetry, tidyText, ignoredBy, pageErrorsFail, dialogPolicy, isSelector, lighthouseSummary, lookFails, lookProblems, parseSteps, planWords, rankMatches, resolveUrl, seeVerdict, splitOrdinal, stepLabel, tokenize, type MatchInfo } from './steps.ts'
 
 test('tokenize keeps quoted words whole and stops at a comment', () => {
   assert.deepEqual(tokenize(`fill "Message" 'hi there'  # say hi`), ['fill', 'Message', 'hi there'])
@@ -155,4 +155,28 @@ test('cookie and clear-cookies parse; a domain after clear-cookies is optional; 
   ])
   assert.equal(stepLabel({ verb: 'cookie', name: 'sid', value: 's3cret' }), 'cookie "sid" (value 6 chars)')
   assert.equal(stepLabel({ verb: 'clear-cookies', domain: '.example.com' }), 'clear-cookies ".example.com"')
+})
+
+test('tidyText squeezes whitespace and repeats so more of the page fits', () => {
+  assert.equal(tidyText('  Earnings \t this\u00a0month \n\n\n\n Total \n Total\n\n'), 'Earnings this month\n\nTotal')
+  const long = tidyText(`${'word '.repeat(380)}\n${'more '.repeat(300)}`, 2_000)
+  assert.ok(long.length <= 2_000 && !long.includes('more'), String(long.length))
+})
+
+test('dev overlays are hidden for the look unless they show an error', () => {
+  assert.match(devOverlayStyle({ nextDialog: false, viteOverlay: false, sawErrors: false }), /^nextjs-portal, .*\{ display: none !important; \}$/)
+  assert.equal(devOverlayStyle({ nextDialog: true, viteOverlay: false, sawErrors: true }), '')
+  assert.match(devOverlayStyle({ nextDialog: false, viteOverlay: true, sawErrors: false }), /vite-error-overlay/)
+  assert.doesNotMatch(devOverlayStyle({ nextDialog: false, viteOverlay: true, sawErrors: true }), /vite-error-overlay/)
+})
+
+test('a failed see is asked again once, after the page settles', async () => {
+  const answers = (ps: Array<number | null>) => { let i = 0; return async () => ps[i++] ?? null }
+  let settled = 0
+  const settle = async () => { settled++ }
+  assert.deepEqual(await judgeWithRetry('see', answers([0.02, 0.93]), settle), { ok: true, note: 'p 0.02, then p 0.93 after the page settled' })
+  assert.deepEqual(await judgeWithRetry('see', answers([0.9]), settle), { ok: true, note: 'p 0.90' })
+  assert.deepEqual(await judgeWithRetry('nosee', answers([0.8, 0.7]), settle), { ok: false, note: 'p 0.80, then p 0.70 after the page settled' })
+  assert.deepEqual(await judgeWithRetry('see', answers([null]), settle), { ok: false, note: 'no answer from the classifier' })
+  assert.equal(settled, 2)
 })

@@ -11,6 +11,8 @@ import { createServer as netServer, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { chromium } from 'playwright-core'
+import { settleForLook } from './settle.ts'
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..')
 const CHROME = [process.env.CHROME_PATH, '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/google-chrome'].find((p) => p && existsSync(p))
@@ -62,6 +64,9 @@ const ROUTES: Record<string, Handler> = {
       <div id="st-menu" hidden><div onclick="picked.status = 'Approved'; pop('st-menu')">Approved</div><div onclick="picked.status = 'Rejected'; pop('st-menu')">Rejected</div></div></div>
     <label>Size <select onchange="picked.size = this.value"><option>S</option><option>M</option></select></label>`),
   '/upload': html(`<label for="f">Attach</label><input type="file" id="f" onchange="document.body.dataset.hit = this.files[0].name">`),
+  // DOM changes every 50 ms for 700 ms, then the page is still; /busy never stops.
+  '/late': html(`<div id="x"></div><script>const t0 = Date.now(); const iv = setInterval(() => { x.textContent = String(Date.now()); if (Date.now() - t0 > 700) clearInterval(iv) }, 50)</script>`),
+  '/busy': html(`<div id="x"></div><script>setInterval(() => { x.textContent = String(Date.now()) }, 50)</script>`),
   // An open side panel over the page, with a backdrop.
   '/panel': html(`${HIT}<main><button onclick="hit('page')">Add adjustment</button></main>
     <div style="position:fixed;inset:0;background:rgba(0,0,0,.4)"></div>
@@ -248,4 +253,19 @@ test('upload sets a file field it finds directly', { skip }, async () => {
   const r = await uiCheck(['open', '/upload', 'upload', 'Attach', 'package.json', 'eval', 'document.body.dataset.hit'])
   assert.match(r.out, /upload "Attach" "package\.json" {2}name, file field/, r.out)
   assert.deepEqual(printed(r.out), ['package.json'], r.out)
+})
+
+test('settleForLook waits for the page to stop changing, at most its bound', { skip }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME, headless: true })
+  try {
+    const p = await browser.newPage()
+    await p.goto(`${base}/late`)
+    const late = await settleForLook(p)
+    assert.ok(late >= 600 && late < 1_800, `settled after ${late} ms`)
+    await p.goto(`${base}/busy`)
+    const busy = await settleForLook(p, 1_000)
+    assert.ok(busy >= 900 && busy < 1_600, `gave up after ${busy} ms`)
+    await p.goto(`${base}/a`)
+    assert.ok((await settleForLook(p)) < 900)
+  } finally { await browser.close() }
 })

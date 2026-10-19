@@ -50,9 +50,11 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
   dialog accept|dismiss|TEXT  how this run answers alert, confirm and prompt dialogs from here on (TEXT: accept a
                        prompt with TEXT); without it every dialog is dismissed, and each one is printed
   wait SECONDS|TEXT    sleep, or wait up to 15 s for TEXT to show
-  see CLAIM            the classifier checks the screenshot shows CLAIM (fails when it does not)
+  see CLAIM            the classifier checks the screenshot and visible text show CLAIM (fails when they do not);
+                       it waits for the page to settle first (up to 2 s) and asks once more when the answer fails
   nosee CLAIM          the classifier checks the screenshot does not show CLAIM
-  look                 the classifier's health look: error, blank or stuck, broken layout
+  look                 the classifier's health look: error, blank or stuck, broken layout (the Next.js dev
+                       indicator is hidden for it, unless its error dialog is open)
   scroll down|up|TEXT  scroll a screen, or to TEXT
   phone | desktop      390x844 or 1280x800
   dark | light         colour scheme
@@ -290,6 +292,45 @@ export function seeVerdict(verb: 'see' | 'nosee', p: number | null): Verdict {
   if (p === null) return { ok: false, note: 'no answer from the classifier' }
   const yes = p >= 0.5
   return { ok: verb === 'see' ? yes : !yes, note: `p ${p.toFixed(2)}` }
+}
+
+/**
+ * A see or nosee that failed is asked once more after the page settles (a screenshot taken before
+ * paint, right after a client-side navigation, is the usual false fail). No answer is not retried.
+ */
+export async function judgeWithRetry(verb: 'see' | 'nosee', once: () => Promise<number | null>, settle: () => Promise<void>): Promise<Verdict> {
+  const first = seeVerdict(verb, await once())
+  if (first.ok || first.note === seeVerdict(verb, null).note) return first
+  await settle()
+  const again = seeVerdict(verb, await once())
+  return { ok: again.ok, note: `${first.note}, then ${again.note} after the page settled` }
+}
+
+/** Visible text for the classifier: whitespace squeezed, blank runs and repeated lines dropped, cut at a line end. */
+export function tidyText(text: string, max = 4_000): string {
+  const out: string[] = []
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/[ \t\u00a0]+/g, ' ').trim()
+    const prev = out.at(-1)
+    if (line === '' ? prev === '' || prev === undefined : line === prev || (prev === '' && line === out.at(-2))) continue
+    out.push(line)
+  }
+  while (out.at(-1) === '') out.pop()
+  const all = out.join('\n')
+  if (all.length <= max) return all
+  const cut = all.slice(0, max)
+  const nl = cut.lastIndexOf('\n')
+  return nl > max * 0.8 ? cut.slice(0, nl) : cut
+}
+
+/**
+ * CSS for the judged screenshot: the Next.js dev indicator and build badge are hidden unless its error
+ * dialog is open, and Vite's error overlay only when this run saw no error (a stale one).
+ */
+export function devOverlayStyle(o: { nextDialog: boolean; viteOverlay: boolean; sawErrors: boolean }): string {
+  const hide = o.nextDialog ? [] : ['nextjs-portal', '#__next-build-watcher', '#__next-prerender-indicator', '[data-nextjs-toast]', '[data-next-badge-root]']
+  if (o.viteOverlay && !o.sawErrors) hide.push('vite-error-overlay')
+  return hide.length ? `${hide.join(', ')} { display: none !important; }` : ''
 }
 
 /** An error screen this sure fails the step; blank and broken stay warnings (a page may still be loading). */
