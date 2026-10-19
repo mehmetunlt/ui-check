@@ -27,7 +27,7 @@ import { createDecisions } from './classifier/client.ts'
 import { quickCheck, type QuickQuestion } from './classifier/quick-check.ts'
 import type { Decisions } from './classifier/types.ts'
 import { fitForLook } from './look-image.ts'
-import { settleForLook } from './settle.ts'
+import { settleForLook, trackRequests } from './settle.ts'
 import {
   LOOK_QUESTIONS, SEE_ID, USAGE, bestCandidate, devOverlayStyle, ignoredBy, judgeWithRetry, pageErrorsFail, tidyText, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
   rankMatches, resolveUrl, seeQuestion, seeVerdict, splitOrdinal, stepLabel, type Candidate, type MatchInfo, type Step,
@@ -776,6 +776,7 @@ async function main(): Promise<void> {
   await ensureChrome()
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${mode.port}`)
   const page = await sessionPage(browser)
+  trackRequests(page)
   browserRef = browser
   sweepOld()
   await metrics(page).catch(() => {})

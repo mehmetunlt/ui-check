@@ -68,6 +68,9 @@ const ROUTES: Record<string, Handler> = {
     <form action="/b"><input name="q" aria-label="Query"></form>`),
   // DOM changes every 50 ms for 700 ms, then the page is still; /busy never stops.
   '/late': html(`<div id="x"></div><script>const t0 = Date.now(); const iv = setInterval(() => { x.textContent = String(Date.now()); if (Date.now() - t0 > 700) clearInterval(iv) }, 50)</script>`),
+  // A client navigation: the content comes with a slow fetch, after a quiet spell.
+  '/rsc': html(`<h1 id="h">Home</h1><button onclick="history.pushState({}, '', '/next'); setTimeout(() => fetch('/slow').then((r) => r.text()).then((t) => { h.textContent = t }), 50)">Next</button>`),
+  '/slow': (_req, res) => { setTimeout(() => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('Loaded') }, 900) },
   '/busy': html(`<div id="x"></div><script>setInterval(() => { x.textContent = String(Date.now()) }, 50)</script>`),
   // An open side panel over the page, with a backdrop.
   '/panel': html(`${HIT}<main><button onclick="hit('page')">Add adjustment</button></main>
@@ -277,5 +280,10 @@ test('settleForLook waits for the page to stop changing, at most its bound', { s
     assert.ok(busy >= 900 && busy < 1_600, `gave up after ${busy} ms`)
     await p.goto(`${base}/a`)
     assert.ok((await settleForLook(p)) < 900)
+    await p.goto(`${base}/rsc`)
+    await p.waitForLoadState('networkidle')
+    await p.click('button')
+    await settleForLook(p)
+    assert.equal(await p.textContent('h1'), 'Loaded')
   } finally { await browser.close() }
 })
