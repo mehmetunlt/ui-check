@@ -14,7 +14,8 @@ ui-check --base http://localhost:3000 \
 
 - Chrome runs hidden (headless) and stays open between runs with its own profile, so sign-ins are kept. Each session (`UI_CHECK_SESSION`, else the Claude Code session or calling process, per project) gets its own tab, and its runs take turns on it. `--show` and `--slow` use a visible window; `--close` closes the session's tab and stops Chrome when no other session uses it.
 - `see`, `nosee` and `look` ask the classifier about the screenshot. A click or fill whose words match nothing asks it which visible control they mean.
-- `console`, `network`, `response`, `cookies`, `storage` and `a11y` inspect the page like the browser devtools.
+- When several elements match a click or fill, the one in an open dialog, not covered, in view, or the focused form's submit button wins, and the line says which; `click Payouts 2` or `click 'second Payouts'` picks one. `select` also drives custom dropdowns.
+- `console`, `network`, `response`, `cookies`, `storage` and `a11y` inspect the page like the browser devtools; `cookie NAME VALUE` and `clear-cookies [DOMAIN]` change cookies, `eval` runs expressions or statements, and `ignore TEXT` turns expected errors into info lines.
 - `drag`, `upload` and `dialog` cover drag and drop, file pickers and alert, confirm and prompt dialogs.
 - `perf`, `heap` (memory snapshots and leak deltas), `trace start|stop` and `lighthouse` (run on demand with npx, pinned) cover performance and memory.
 
