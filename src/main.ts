@@ -321,6 +321,7 @@ async function settle(page: Page): Promise<void> {
  * A text match counts as the control around it. Page code, kept as a string: no DOM types here.
  */
 const MATCH_JS = new Function('els', 'fields', `return els.slice(0, 60).map((raw) => {
+  if (raw.closest('[data-ui-check-trigger]')) return null
   const r = raw.getBoundingClientRect()
   if (r.width < 1 || r.height < 1 || (raw.checkVisibility && !raw.checkVisibility({ opacityProperty: true, visibilityProperty: true }))) return null
   const el = fields ? raw : (raw.closest('button, a[href], [role=button], [role=link], [role=tab], [role=menuitem], [role=option], [role=checkbox], [role=radio], [role=switch], summary, label, input') || raw)
@@ -399,6 +400,47 @@ async function candidates(page: Page, fields: boolean): Promise<Candidate[]> {
   return page.evaluate<Candidate[]>(`(${CANDIDATES_JS})(${fields})`)
 }
 
+/**
+ * Fields whose label text is TARGET though the label is not wired to them: a label or text just
+ * before the field (or before the box holding it), text inside a wrapping element, aria-labelledby.
+ * They are marked data-ui-check-label="exact" or "loose" for the field tiers. For select, the
+ * element right after the label counts too (a custom dropdown's trigger is often a plain div).
+ */
+const LABEL_JS = new Function('o', `
+  for (const old of document.querySelectorAll('[data-ui-check-label]')) old.removeAttribute('data-ui-check-label')
+  const norm = (t) => (t || '').replace(/\\s+/g, ' ').replace(/[\\s*:]+$/, '').trim().toLowerCase()
+  const want = norm(o.target)
+  if (!want) return 0
+  const FIELD = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]), textarea, select, [contenteditable=""], [contenteditable=true], [role=textbox], [role=combobox], [role=searchbox], [role=spinbutton]'
+    + (o.select ? ', button, [aria-haspopup], [role=button], [tabindex]:not([tabindex="-1"])' : '')
+  const found = new Map()
+  const add = (f, how) => { if (f && !(found.get(f) === 'exact')) found.set(f, how) }
+  const fieldAfter = (l) => {
+    for (let n = l, up = 0; n && n !== document.body && up < 3; n = n.parentElement, up++) {
+      for (let sib = n.nextElementSibling; sib; sib = sib.nextElementSibling) {
+        const f = sib.matches(FIELD) ? sib : sib.querySelector(FIELD)
+        if (f) return f
+        if (o.select && up === 0) return sib
+      }
+    }
+    return null
+  }
+  for (const f of document.querySelectorAll('[aria-labelledby]')) {
+    const t = norm(f.getAttribute('aria-labelledby').split(/\\s+/).map((id) => (document.getElementById(id) || {}).innerText || '').join(' '))
+    if (t === want) add(f, 'exact'); else if (t.includes(want)) add(f, 'loose')
+  }
+  for (const l of document.querySelectorAll('label, legend, dt, th, span, div, p, strong, b, h3, h4, h5, h6')) {
+    if (l.children.length > 3 || l.matches(FIELD)) continue
+    const t = norm(l.innerText)
+    if (!t || t.length > 80 || !t.includes(want)) continue
+    const how = t === want ? 'exact' : 'loose'
+    if (l.tagName === 'LABEL' && l.control) { add(l.control, how); continue }
+    add(l.querySelector(FIELD) || fieldAfter(l), how)
+  }
+  for (const [f, how] of found) f.setAttribute('data-ui-check-label', how)
+  return found.size
+`) as (o: { target: string; select: boolean }) => number
+
 /** The locators that name an element, best first: exact name, then looser names and text. */
 function tiers(page: Page, target: string, fields: boolean): Array<[Locator, string]> {
   const any = (locs: Locator[]) => locs.reduce((a, b) => a.or(b))
@@ -406,6 +448,8 @@ function tiers(page: Page, target: string, fields: boolean): Array<[Locator, str
     ? [
         [any([page.getByLabel(target, { exact: true }), page.getByPlaceholder(target, { exact: true }), ...FIELD_ROLES.map((r) => page.getByRole(r, { name: target, exact: true }))]), 'name'],
         [any([page.getByLabel(target), page.getByPlaceholder(target), ...FIELD_ROLES.map((r) => page.getByRole(r, { name: target }))]), 'text'],
+        [page.locator('[data-ui-check-label=exact]'), 'label'],
+        [page.locator('[data-ui-check-label]'), 'label'],
       ]
     : [
         [any(CLICK_ROLES.map((r) => page.getByRole(r, { name: target, exact: true }))), 'name'],
@@ -419,13 +463,18 @@ function tiers(page: Page, target: string, fields: boolean): Array<[Locator, str
 async function find(page: Page, verb: 'click' | 'hover' | 'fill' | 'select', target: string, nth?: number): Promise<Hit | null> {
   const fields = verb === 'fill' || verb === 'select'
   if (isSelector(target)) return choose(page.locator(target), 'selector', fields, nth)
-  for (const [loc, how] of tiers(page, target, fields)) {
+  // A custom dropdown's trigger may be a button named for the field.
+  const all = async (words: string) => {
+    if (fields) await page.evaluate(LABEL_JS, { target: words, select: verb === 'select' }).catch(() => 0)
+    return [...tiers(page, words, fields), ...(verb === 'select' ? tiers(page, words, false) : [])]
+  }
+  for (const [loc, how] of await all(target)) {
     const hit = await choose(loc, how, fields, nth)
     if (hit) return hit
   }
   const ord = nth === undefined ? splitOrdinal(target) : null
   if (ord) {
-    for (const [loc, how] of tiers(page, ord.rest, fields)) {
+    for (const [loc, how] of await all(ord.rest)) {
       const hit = await choose(loc, how, fields, ord.nth)
       if (hit) return hit
     }
@@ -439,6 +488,52 @@ async function find(page: Page, verb: 'click' | 'hover' | 'fill' | 'select', tar
   const c = cands.find((x) => x.idx === best.idx)
   return { loc, how: `picked "${(c?.name || c?.tag || '').slice(0, 50)}" p ${best.p.toFixed(2)}` }
 }
+
+// Playwright calls a function, not a string holding one (that is evaluated as an expression).
+const IS_SELECT_JS = new Function('el', `return el.tagName === 'SELECT'`) as (el: unknown) => boolean
+const IS_FILE_JS = new Function('el', `return el.tagName === 'INPUT' && el.type === 'file'`) as (el: unknown) => boolean
+const FOCUSED_TEXT_JS = `(() => {
+  const a = document.activeElement
+  return !!a && ((a.tagName === 'INPUT' && /^(text|search|)$/i.test(a.getAttribute('type') || '')) || a.isContentEditable)
+})()`
+const OPTION_ROLES = ['option', 'menuitem', 'menuitemradio', 'menuitemcheckbox', 'treeitem', 'gridcell'] as const
+
+/**
+ * select on anything but a native select: open the control, type into its search box when one has
+ * focus (or appears), then click the option by its name or text, as click finds it (the control
+ * itself is left out, since it often shows the current value).
+ */
+async function customSelect(page: Page, hit: Hit, option: string): Promise<Outcome> {
+  await hit.loc.click({ timeout: 8_000 })
+  await sleep(250)
+  let typed = await page.evaluate<boolean>(FOCUSED_TEXT_JS).catch(() => false)
+  if (!typed) {
+    const search = page.locator('input[type=search], input[placeholder*="search" i], [role=listbox] input, [role=dialog] input, [role=combobox] input').filter({ visible: true })
+    if (await search.count().catch(() => 0)) { await search.first().focus().catch(() => {}); typed = await page.evaluate<boolean>(FOCUSED_TEXT_JS).catch(() => false) }
+  }
+  if (typed) {
+    await page.locator(':focus').fill(option, { timeout: 4_000 })
+    await sleep(400)
+  }
+  await hit.loc.evaluate(MARK_TRIGGER_JS, true).catch(() => {})
+  try {
+    const any = (locs: Locator[]) => locs.reduce((a, b) => a.or(b))
+    const optionTiers: Array<[Locator, string]> = [
+      [any(OPTION_ROLES.map((r) => page.getByRole(r, { name: option, exact: true }))), 'option'],
+      [any(OPTION_ROLES.map((r) => page.getByRole(r, { name: option }))), 'option'],
+      ...tiers(page, option, false),
+    ]
+    let pick: Hit | null = null
+    for (const [loc, how] of optionTiers) if ((pick = await choose(loc, how, false))) break
+    pick ??= await find(page, 'click', option)
+    if (!pick) return { ok: false, note: `${hit.how}; opened${typed ? `, typed "${option}"` : ''}, but no option "${option}" shows` }
+    await pick.loc.click({ timeout: 8_000 })
+    await settle(page)
+    return { ok: true, note: `${hit.how}; opened${typed ? `, typed "${option}"` : ''}, clicked ${pick.how}` }
+  } finally { await hit.loc.evaluate(MARK_TRIGGER_JS, false).catch(() => {}) }
+}
+
+const MARK_TRIGGER_JS = new Function('el', 'on', `if (on) el.setAttribute('data-ui-check-trigger', ''); else el.removeAttribute('data-ui-check-trigger')`) as (el: unknown, on: boolean) => void
 
 const AsyncFunction = (async () => {}).constructor as new (...args: string[]) => unknown
 
@@ -488,7 +583,8 @@ async function run(page: Page, s: Step): Promise<Outcome> {
       const hit = await find(page, s.verb, s.target, s.nth)
       if (!hit) return { ok: false, note: 'no such field' }
       if (s.verb === 'fill') await hit.loc.fill(s.value, { timeout: 8_000 })
-      else await hit.loc.selectOption({ label: s.value }, { timeout: 8_000 })
+      else if (await hit.loc.evaluate(IS_SELECT_JS)) await hit.loc.selectOption({ label: s.value }, { timeout: 8_000 })
+      else return customSelect(page, hit, s.value)
       return { ok: true, note: hit.how }
     }
     case 'drag': {
@@ -515,7 +611,7 @@ async function run(page: Page, s: Step): Promise<Outcome> {
       if (!existsSync(file)) return { ok: false, note: `no such file: ${file}` }
       const hit = await find(page, 'click', s.target)
       if (hit) {
-        if (await hit.loc.evaluate(`(el) => el.tagName === 'INPUT' && el.type === 'file'`)) {
+        if (await hit.loc.evaluate(IS_FILE_JS)) {
           await hit.loc.setInputFiles(file)
           return { ok: true, note: `${hit.how}, file field` }
         }

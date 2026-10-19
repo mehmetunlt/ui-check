@@ -39,6 +39,29 @@ const ROUTES: Record<string, Handler> = {
   '/click-error': html(`<button onclick="throw new Error('handler broke')">Go</button>`),
   '/set': (_req, res) => { res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'tok=old; HttpOnly; Path=/' }); res.end(page('<h1>Signed in</h1>')) },
   '/whoami': (req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end(/(?:^|; )tok=([^;]*)/.exec(req.headers.cookie ?? '')?.[1] ?? '') },
+  // Fields labelled every way forms do it, not all of them wired up.
+  '/fields': html(`<div><label>Reason</label><textarea id="f1"></textarea></div>
+    <div class="field"><div class="label">Internal memo <span>*</span></div><div class="wrap"><textarea id="f2"></textarea></div></div>
+    <div><span id="nl">Notes</span><div id="f3" contenteditable="true" aria-labelledby="nl" style="min-height:20px"></div></div>
+    <p>Bio</p><div id="f4" contenteditable="true" style="min-height:20px"></div>
+    <label>Comment <textarea id="f5"></textarea></label>`),
+  // Custom dropdowns: an ARIA combobox, a searchable one of plain divs, a plain div menu, and a native select.
+  '/selects': html(`<script>window.picked = {}
+    function pop(id, show) { document.getElementById(id).hidden = !show }
+    </script>
+    <div><label id="cl">Country</label>
+      <button role="combobox" aria-labelledby="cl" aria-haspopup="listbox" onclick="pop('cl-list', true)">Choose</button>
+      <ul role="listbox" id="cl-list" hidden><li role="option" onclick="picked.country = 'Turkey'; pop('cl-list')">Turkey</li><li role="option" onclick="picked.country = 'Germany'; pop('cl-list')">Germany</li></ul></div>
+    <div><div>City</div><div class="select" tabindex="0" onclick="pop('city-pop', true); document.getElementById('city-q').focus()">Select…</div>
+      <div id="city-pop" hidden><input id="city-q" placeholder="Search" oninput="filter(this.value)"><div id="city-list"></div></div></div>
+    <script>const CITIES = ['Ankara', 'Istanbul', 'Izmir', 'Bursa', 'Antalya', 'Trabzon']
+      function filter(q) { document.getElementById('city-list').innerHTML = CITIES.filter((c) => c.toLowerCase().includes(q.toLowerCase())).slice(0, 3)
+        .map((c) => '<div onclick="picked.city = \\'' + c + '\\'; pop(\\'city-pop\\')">' + c + '</div>').join('') }
+      filter('')</script>
+    <div><label>Status</label><div class="dropdown-trigger" onclick="pop('st-menu', true)">Pending</div>
+      <div id="st-menu" hidden><div onclick="picked.status = 'Approved'; pop('st-menu')">Approved</div><div onclick="picked.status = 'Rejected'; pop('st-menu')">Rejected</div></div></div>
+    <label>Size <select onchange="picked.size = this.value"><option>S</option><option>M</option></select></label>`),
+  '/upload': html(`<label for="f">Attach</label><input type="file" id="f" onchange="document.body.dataset.hit = this.files[0].name">`),
   // An open side panel over the page, with a backdrop.
   '/panel': html(`${HIT}<main><button onclick="hit('page')">Add adjustment</button></main>
     <div style="position:fixed;inset:0;background:rgba(0,0,0,.4)"></div>
@@ -204,4 +227,25 @@ test('cookie sets one for the page (an httpOnly one keeps its flags) and clear-c
   assert.match(r.out, /clear-cookies "example\.com" {2}0 cleared/)
   assert.match(r.out, /clear-cookies {2}2 cleared/)
   assert.deepEqual(lines.slice(-2), ['n3w-v4lue', ''], r.out)
+})
+
+test('fill finds textareas and contenteditables by wired, wrapping, nearby and aria-labelledby labels', { skip }, async () => {
+  const r = await uiCheck(['open', '/fields', 'fill', 'Reason', 'r', 'fill', 'Internal memo', 'm', 'fill', 'Notes', 'n', 'fill', 'Bio', 'b', 'fill', 'Comment', 'c',
+    'eval', "[f1.value, f2.value, f3.innerText, f4.innerText, f5.value].join('|')"])
+  assert.equal(r.code, 0, r.out)
+  assert.deepEqual(printed(r.out), ['r|m|n|b|c'], r.out)
+})
+
+test('select drives custom dropdowns: opens, searches, clicks the option; native selects as before', { skip }, async () => {
+  const r = await uiCheck(['open', '/selects', 'select', 'Country', 'Germany', 'select', 'City', 'Trabzon', 'select', 'Status', 'Rejected', 'select', 'Size', 'M',
+    'eval', 'JSON.stringify(picked)'])
+  assert.equal(r.code, 0, r.out)
+  assert.deepEqual(JSON.parse(printed(r.out).at(-1) ?? '{}'), { country: 'Germany', city: 'Trabzon', status: 'Rejected', size: 'M' }, r.out)
+  assert.match(r.out, /select "City" "Trabzon" .*typed/)
+})
+
+test('upload sets a file field it finds directly', { skip }, async () => {
+  const r = await uiCheck(['open', '/upload', 'upload', 'Attach', 'package.json', 'eval', 'document.body.dataset.hit'])
+  assert.match(r.out, /upload "Attach" "package\.json" {2}name, file field/, r.out)
+  assert.deepEqual(printed(r.out), ['package.json'], r.out)
 })

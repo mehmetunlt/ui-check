@@ -39,8 +39,10 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
                        the focused form's submit button, then one outside the nav; the line says which.
                        N (or "second TEXT", "last TEXT") picks the Nth match, top to bottom; fill and select take N too
   hover TEXT [N]       as click, without clicking
-  fill FIELD VALUE [N] a field by label, placeholder or name (classifier fallback as for click)
-  select FIELD OPTION [N]  pick an option in a select
+  fill FIELD VALUE [N] a field (input, textarea, contenteditable) by its label (wired, wrapping, aria-labelledby or
+                       the text just before it), placeholder or name (classifier fallback as for click)
+  select FIELD OPTION [N]  pick an option in a native select, or in a custom dropdown: opens it, types OPTION into
+                       its search box when one shows, then clicks the option by its name or text
   press KEY            Enter, Escape, Tab, Meta+k…
   drag FROM TO         drag one element onto another (each found as click finds it, or by its text)
   upload TARGET FILE   a file into the file field TARGET names, or through the picker the control TARGET opens;
