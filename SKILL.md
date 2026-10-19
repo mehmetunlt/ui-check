@@ -55,8 +55,9 @@ The exit code is 1 when a step failed.
 ## Working rules
 
 - One run per walk; chain the steps in one command. Runs continue where the last left off (same tab, same page), so a follow-up run can start without `open`.
+- Each session has its own tab (cookies and sign-ins are shared), so parallel sessions never drive each other's page, and two runs of one session take turns. The session is the Claude Code session in this project (a worktree is a project of its own); subagents running ui-check in parallel in one checkout should each set `UI_CHECK_SESSION=<name>`.
 - Read a screenshot only when a step FAILs or a `look` warns: the failing line prints its path. Never take screenshots just to look.
-- Chrome stays open between runs with its own profile under `~/.cache/agents-ui-check` (sign-ins are kept). Leave it open while testing in succession; run `ui-check --close` when done for a while. It stops only the Chromes it started (by PID).
+- Chrome stays open between runs with its own profile under `~/.cache/agents-ui-check` (sign-ins are kept). Leave it open while testing in succession; `ui-check --close` closes this session's tab and stops Chrome only when no other session has used it in the last 10 minutes. It stops only the Chromes it started (by PID).
 - `see` answers are a fast judgment, not proof. When a FAIL looks wrong, open the screenshot before concluding, and rephrase the claim to be concrete.
 - Never sign in with a real person's account or submit anything that sends mail, money or messages outside a test setup.
 

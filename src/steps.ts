@@ -67,9 +67,11 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
   back | reload
 A plan file has one step per line, quoted like a shell ("…" or '…'), # for comments.
 Screenshots, snapshots, traces and reports go to $TMPDIR/agents-ui-check and are deleted after a day.
-Chrome runs hidden (headless) and stays open between runs (one tab, its own profile, so sign-in is kept).
+Chrome runs hidden (headless) and stays open between runs (its own profile, so sign-in is kept). Each session
+has a tab of its own, and its runs take turns on it: UI_CHECK_SESSION names the session; by default it is the
+Claude Code session (or the calling process) in this project.
 --show uses a visible window instead (its own profile and sign-ins); --slow shows it and pauses between
-steps so a person can watch; --close stops the Chrome a run used (alone: both).`
+steps so a person can watch; --close closes this session's tab and stops Chrome unless other sessions use it.`
 
 /** Splits one line like a shell would for quoted words: "a b" and 'a b' are one word, \\" escapes. */
 export function tokenize(line: string): string[] {

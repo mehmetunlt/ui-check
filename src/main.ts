@@ -10,7 +10,7 @@
  * failed same-origin requests (warn); `look` fails on an error screen and warns on a blank or broken one.
  *
  * Chrome keeps running between runs with its own profile under ~/.cache/agents-ui-check, so a
- * sign-in is kept and successive checks reuse one tab. By default it is headless (port 9334), so
+ * sign-in is kept; each session reuses a tab of its own (session.ts). By default it is headless (port 9334), so
  * nothing comes up on the screen; `--show` (and `--slow`) use a visible window instead (port 9333,
  * a profile of its own, so each keeps its own sign-ins). `--close` stops both by the PIDs they
  * wrote, never by pattern. Screenshots go to
@@ -30,13 +30,16 @@ import {
   LOOK_QUESTIONS, SEE_ID, USAGE, bestCandidate, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
   resolveUrl, seeQuestion, seeVerdict, stepLabel, type Candidate, type Step,
 } from './steps.ts'
+import { acquireLock, activeSessions, callerId, listProcs, lockHolder, projectRoot, readRegistry, sessionKey, staleSessions, writeRegistry } from './session.ts'
 
 
-const STATE_DIR = join(homedir(), '.cache', 'agents-ui-check')
-type Mode = { port: number; profile: string; pidFile: string; headless: boolean }
+// UI_CHECK_STATE and UI_CHECK_PORT give the tests a Chrome of their own.
+const STATE_DIR = process.env.UI_CHECK_STATE || join(homedir(), '.cache', 'agents-ui-check')
+const PORT = Number(process.env.UI_CHECK_PORT) || 9334
+type Mode = { port: number; profile: string; pidFile: string; sessions: string; headless: boolean }
 const MODES: Record<'shown' | 'hidden', Mode> = {
-  shown: { port: 9333, profile: join(STATE_DIR, 'profile'), pidFile: join(STATE_DIR, 'chrome.pid'), headless: false },
-  hidden: { port: 9334, profile: join(STATE_DIR, 'profile-hidden'), pidFile: join(STATE_DIR, 'chrome-hidden.pid'), headless: true },
+  shown: { port: PORT - 1, profile: join(STATE_DIR, 'profile'), pidFile: join(STATE_DIR, 'chrome.pid'), sessions: join(STATE_DIR, 'sessions.json'), headless: false },
+  hidden: { port: PORT, profile: join(STATE_DIR, 'profile-hidden'), pidFile: join(STATE_DIR, 'chrome-hidden.pid'), sessions: join(STATE_DIR, 'sessions-hidden.json'), headless: true },
 }
 const SHOTS = join(tmpdir(), 'agents-ui-check')
 const CHROME = [process.env.CHROME_PATH, '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/google-chrome'].find((p) => p && existsSync(p))
@@ -64,9 +67,14 @@ for (let i = 0; i < argv.length; i++) {
   else words.push(a)
 }
 
+// This caller's tab: see session.ts.
+const SESSION = sessionKey(callerId(process.env, process.env.UI_CHECK_SESSION || process.env.CLAUDE_CODE_SESSION_ID ? [] : listProcs(), process.pid), projectRoot(process.cwd()))
+const tabLock = (m: Mode, key: string) => join(STATE_DIR, 'locks', `${m.headless ? 'hidden' : 'shown'}-${key}.lock`)
+const tabLocked = (m: Mode) => (key: string) => lockHolder(tabLock(m, key)) !== null
+
 if (close && words.length === 0) {
-  stopChrome(MODES.shown)
-  stopChrome(MODES.hidden)
+  stopUnlessShared(MODES.shown)
+  stopUnlessShared(MODES.hidden)
   process.exit(0)
 }
 const mode = show ? MODES.shown : MODES.hidden
@@ -102,6 +110,52 @@ function stopChrome(m: Mode): void {
   const pid = Number(readFileSync(m.pidFile, 'utf8'))
   try { process.kill(pid, 'SIGTERM'); console.log(`stopped the ${which} ui-check Chrome (pid ${pid})`) } catch { console.log(`the ${which} ui-check Chrome was not running`) }
   rmSync(m.pidFile, { force: true })
+  rmSync(m.sessions, { force: true })
+}
+
+/** --close: Chrome stops unless other sessions are using it (a run going, or one in the last minutes). */
+function stopUnlessShared(m: Mode): boolean {
+  const others = activeSessions(readRegistry(m.sessions), SESSION, Date.now(), tabLocked(m))
+  if (others.length && existsSync(m.pidFile)) {
+    console.log(`left the ${m.headless ? 'hidden' : 'visible'} ui-check Chrome running: ${others.length} other ${others.length === 1 ? 'session uses' : 'sessions use'} it`)
+    return false
+  }
+  stopChrome(m)
+  return true
+}
+
+async function targetId(p: Page): Promise<string> {
+  const s = await p.context().newCDPSession(p)
+  try { return (await s.send('Target.getTargetInfo')).targetInfo.targetId } finally { await s.detach().catch(() => {}) }
+}
+
+/** This session's tab, opened on its first run; other sessions' tabs idle for hours are closed. */
+async function sessionPage(browser: Browser): Promise<Page> {
+  const ctx = browser.contexts()[0] ?? (await browser.newContext())
+  const release = await acquireLock(`${mode.sessions}.lock`, 15_000)
+  try {
+    const reg = readRegistry(mode.sessions)
+    const pages = ctx.pages()
+    const ids = await Promise.all(pages.map((p) => targetId(p).catch(() => '')))
+    const pageOf = (key: string) => { const i = reg[key] ? ids.indexOf(reg[key].target) : -1; return i >= 0 ? pages[i] : undefined }
+    const now = Date.now()
+    for (const k of staleSessions(reg, SESSION, now, tabLocked(mode))) { await pageOf(k)?.close().catch(() => {}); delete reg[k] }
+    for (const k of Object.keys(reg)) if (!pageOf(k)) delete reg[k]
+    let page = pageOf(SESSION)
+    if (!page) page = await ctx.newPage()
+    reg[SESSION] = { target: await targetId(page), used: now }
+    writeRegistry(mode.sessions, reg)
+    return page
+  } finally { release() }
+}
+
+async function forgetSession(): Promise<void> {
+  const release = await acquireLock(`${mode.sessions}.lock`, 15_000)
+  try {
+    const reg = readRegistry(mode.sessions)
+    delete reg[SESSION]
+    writeRegistry(mode.sessions, reg)
+  } finally { release() }
 }
 
 // ── run state ────────────────────────────────────────────────────────────────
@@ -491,10 +545,13 @@ async function run(page: Page, s: Step): Promise<Outcome> {
 }
 
 async function main(): Promise<void> {
+  // One run at a time on a tab: a second run of this session waits for the first.
+  const releaseTab = await acquireLock(tabLock(mode, SESSION), 300_000, (pid) => console.log(`info waiting for another run on this session's tab (pid ${pid})`))
+  process.on('exit', releaseTab)
+  for (const [sig, n] of [['SIGINT', 2], ['SIGTERM', 15], ['SIGHUP', 1]] as const) process.on(sig, () => process.exit(128 + n))
   await ensureChrome()
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${mode.port}`)
-  const ctx = browser.contexts()[0] ?? (await browser.newContext())
-  const page = ctx.pages()[0] ?? (await ctx.newPage())
+  const page = await sessionPage(browser)
   browserRef = browser
   sweepOld()
   await metrics(page).catch(() => {})
@@ -557,7 +614,11 @@ async function main(): Promise<void> {
   }
   const secs = ((Date.now() - t0) / 1000).toFixed(1)
   console.log(`\n${steps.length} steps, ${failures} failed, ${warnings} warnings, ${calls} classifier calls ($${(costMicroUsd / 1e6).toFixed(4)}), ${secs} s`)
-  if (close) { await browser.close().catch(() => {}); stopChrome(mode) }
+  if (close) {
+    await page.close().catch(() => {})
+    await forgetSession()
+    if (!stopUnlessShared(mode)) console.log("info closed this session's tab")
+  }
 }
 
 main().then(

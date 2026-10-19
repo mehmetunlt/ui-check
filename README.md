@@ -12,7 +12,7 @@ ui-check --base http://localhost:3000 \
 
 `ui-check --help` lists every step; `SKILL.md` is the guide agents read.
 
-- Chrome runs hidden (headless) and stays open between runs with its own profile, so sign-ins are kept. `--show` and `--slow` use a visible window; `--close` stops it.
+- Chrome runs hidden (headless) and stays open between runs with its own profile, so sign-ins are kept. Each session (`UI_CHECK_SESSION`, else the Claude Code session or calling process, per project) gets its own tab, and its runs take turns on it. `--show` and `--slow` use a visible window; `--close` closes the session's tab and stops Chrome when no other session uses it.
 - `see`, `nosee` and `look` ask the classifier about the screenshot. A click or fill whose words match nothing asks it which visible control they mean.
 - `console`, `network`, `response`, `cookies`, `storage` and `a11y` inspect the page like the browser devtools.
 - `drag`, `upload` and `dialog` cover drag and drop, file pickers and alert, confirm and prompt dialogs.
@@ -32,7 +32,8 @@ and Google Chrome.
 
 ## Develop
 
-`npm run check -- <steps>` runs from source; `npm test`; `npm run typecheck`.
+`npm run check -- <steps>` runs from source; `npm test`; `npm run typecheck`. `src/browser.test.ts` drives a Chrome of
+its own (`UI_CHECK_STATE` and `UI_CHECK_PORT` point a run at another profile and port) over pages it serves.
 
 `src/classifier`, `src/models`, `src/look-image.ts` and `src/png.ts` are copied from the agents-system
 repo (its decisions client, cost tracking and screenshot fitting), trimmed to what this needs.
