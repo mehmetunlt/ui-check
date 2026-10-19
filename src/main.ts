@@ -821,6 +821,7 @@ async function main(): Promise<void> {
     if (i > 0 && pauseMs) await sleep(pauseMs)
     const began = Date.now()
     stepDoc = null
+    const urlBefore = page.url()
     let out: Outcome
     try { out = await run(page, s) } catch (e) { out = { ok: false, note: (e as Error).message.split('\n')[0]!.slice(0, 200) } }
     const errors: string[] = []
@@ -831,6 +832,8 @@ async function main(): Promise<void> {
       if (shown && !pageErrorsFail({ docStatus: stepDoc, ...shown })) pending.push(...errors.map((e) => ({ text: `page error: ${e}` })))
       else out = { ok: false, note: [out.note, `page error: ${errors.join('; ')}`].filter(Boolean).join('; ') }
     }
+    // Where a click, key or select took the page, as open says.
+    if (s.verb !== 'open' && page.url() !== urlBefore) out.note = `${out.note ? `${out.note} ` : ''}-> ${page.url()}`
     if (!out.ok) { failures++; out.note = `${out.note ?? ''} [${await saveShot(page, 'fail').catch(() => 'no screenshot')}]`.trim() }
     const ms = Date.now() - began
     console.log(`${out.ok ? 'ok  ' : 'FAIL'} ${stepLabel(s)}${out.note ? `  ${out.note}` : ''}  (${ms} ms)`)

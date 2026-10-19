@@ -64,6 +64,8 @@ const ROUTES: Record<string, Handler> = {
       <div id="st-menu" hidden><div onclick="picked.status = 'Approved'; pop('st-menu')">Approved</div><div onclick="picked.status = 'Rejected'; pop('st-menu')">Rejected</div></div></div>
     <label>Size <select onchange="picked.size = this.value"><option>S</option><option>M</option></select></label>`),
   '/upload': html(`<label for="f">Attach</label><input type="file" id="f" onchange="document.body.dataset.hit = this.files[0].name">`),
+  '/go': html(`<button onclick="location.href = '/b'">Go</button><button onclick="history.pushState({}, '', '/c')">Push</button>
+    <form action="/b"><input name="q" aria-label="Query"></form>`),
   // DOM changes every 50 ms for 700 ms, then the page is still; /busy never stops.
   '/late': html(`<div id="x"></div><script>const t0 = Date.now(); const iv = setInterval(() => { x.textContent = String(Date.now()); if (Date.now() - t0 > 700) clearInterval(iv) }, 50)</script>`),
   '/busy': html(`<div id="x"></div><script>setInterval(() => { x.textContent = String(Date.now()) }, 50)</script>`),
@@ -253,6 +255,14 @@ test('upload sets a file field it finds directly', { skip }, async () => {
   const r = await uiCheck(['open', '/upload', 'upload', 'Attach', 'package.json', 'eval', 'document.body.dataset.hit'])
   assert.match(r.out, /upload "Attach" "package\.json" {2}name, file field/, r.out)
   assert.deepEqual(printed(r.out), ['package.json'], r.out)
+})
+
+test('a step that navigates prints where the page went', { skip }, async () => {
+  const r = await uiCheck(['open', '/go', 'click', 'Go', 'open', '/go', 'click', 'Push', 'open', '/go', 'fill', 'Query', 'x', 'press', 'Enter'])
+  assert.match(r.out, new RegExp(`^ok {3}click "Go" {2}name -> ${base}/b {2}`, 'm'), r.out)
+  assert.match(r.out, new RegExp(`^ok {3}click "Push" {2}name -> ${base}/c {2}`, 'm'), r.out)
+  assert.match(r.out, new RegExp(`^ok {3}press Enter {2}-> ${base}/b\\?q=x {2}`, 'm'), r.out)
+  assert.match(r.out, /^ok {3}fill "Query" "x" {2}name {2}\(/m, r.out)
 })
 
 test('settleForLook waits for the page to stop changing, at most its bound', { skip }, async () => {
