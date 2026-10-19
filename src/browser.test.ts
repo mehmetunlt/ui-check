@@ -37,6 +37,8 @@ const ROUTES: Record<string, Handler> = {
   '/blank-error': html("<script>throw new Error('boom')</script>"),
   '/app-error': html("<h2>Application error: a client-side exception has occurred</h2><script>throw new Error('boom')</script>"),
   '/click-error': html(`<button onclick="throw new Error('handler broke')">Go</button>`),
+  '/set': (_req, res) => { res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'tok=old; HttpOnly; Path=/' }); res.end(page('<h1>Signed in</h1>')) },
+  '/whoami': (req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end(/(?:^|; )tok=([^;]*)/.exec(req.headers.cookie ?? '')?.[1] ?? '') },
   // An open side panel over the page, with a backdrop.
   '/panel': html(`${HIT}<main><button onclick="hit('page')">Add adjustment</button></main>
     <div style="position:fixed;inset:0;background:rgba(0,0,0,.4)"></div>
@@ -188,4 +190,18 @@ test('ignore turns matching errors and responses into info for the rest of the r
   assert.match(r.out, /^info ignored: page error: An error occurred/m)
   assert.match(r.out, /^info ignored: 503 GET \/api\/flaky/m)
   assert.match(r.out, /0 warnings/)
+})
+
+test('cookie sets one for the page (an httpOnly one keeps its flags) and clear-cookies clears them', { skip }, async () => {
+  const whoami = "fetch('/whoami').then((r) => r.text())"
+  const r = await uiCheck(['clear-cookies', 'open', '/set', 'cookie', 'tok', 'n3w-v4lue', 'eval', whoami, 'cookie', 'extra', 'x1', 'eval', 'document.cookie', 'cookies',
+    'clear-cookies', 'example.com', 'eval', whoami, 'clear-cookies', 'eval', whoami])
+  assert.equal(r.code, 0, r.out)
+  const lines = printed(r.out)
+  assert.deepEqual([lines[0], lines[1]], ['n3w-v4lue', 'extra=x1'], r.out)
+  assert.match(r.out, /^ {5}tok .*httpOnly/m)
+  assert.doesNotMatch(r.out.replace(/^ {5}n3w-v4lue$/gm, ''), /n3w-v4lue/)
+  assert.match(r.out, /clear-cookies "example\.com" {2}0 cleared/)
+  assert.match(r.out, /clear-cookies {2}2 cleared/)
+  assert.deepEqual(lines.slice(-2), ['n3w-v4lue', ''], r.out)
 })

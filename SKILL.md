@@ -41,6 +41,7 @@ Run `ui-check --help` for the whole list. The main steps:
   - `network FILTER`: requests with method, status, time and type; FILTER is part of the URL, a type (`fetch`, `xhr`, `document`) or a status (`404`, `failed`); `""` for all.
   - `response FILTER`: the latest matching response's status, headers (cookie and auth headers hidden) and body.
   - `cookies` (values never printed), `storage` (localStorage and sessionStorage), `a11y` (the accessibility tree, roles and names).
+- `cookie NAME VALUE` sets a cookie for the current page's site through the browser, so it can replace an httpOnly session cookie (keeping its flags); `clear-cookies [DOMAIN]` deletes all cookies, or a site's. Values are never printed. The profile is shared, so clearing signs every session out of that site.
 - Performance and memory:
   - `perf`: TTFB, DOMContentLoaded, load, LCP and CLS, script, layout and style time since the run began, element count, bytes, JS heap.
   - `heap`: garbage-collects, then saves a memory snapshot (`.heapsnapshot`, for the DevTools Memory tab) and prints heap size, DOM nodes and listeners. A second `heap` in the same run prints the change, so `heap` before and after repeating an action is a quick leak check.

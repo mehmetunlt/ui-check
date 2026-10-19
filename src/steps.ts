@@ -18,6 +18,8 @@ export type Step =
   | { verb: 'scroll'; target: string }
   | { verb: 'eval'; script: string }
   | { verb: 'ignore'; pattern: string }
+  | { verb: 'cookie'; name: string; value: string }
+  | { verb: 'clear-cookies'; domain?: string }
   | { verb: 'network'; filter: string }
   | { verb: 'response'; filter: string }
   | { verb: 'phone' | 'desktop' | 'dark' | 'light' | 'shot' | 'read' | 'look' | 'back' | 'reload' | 'console' | 'cookies' | 'storage' | 'a11y' | 'perf' | 'heap' | 'lighthouse' }
@@ -25,7 +27,7 @@ export type Step =
 /** How many words each verb takes after it. */
 export const VERB_ARITY: Record<Step['verb'], number> = {
   open: 1, click: 1, hover: 1, fill: 2, select: 2, press: 1, wait: 1, see: 1, nosee: 1, scroll: 1, eval: 1,
-  network: 1, response: 1, ignore: 1, drag: 2, upload: 2, dialog: 1, trace: 1, perf: 0, heap: 0, lighthouse: 0,
+  network: 1, response: 1, ignore: 1, cookie: 2, 'clear-cookies': 0, drag: 2, upload: 2, dialog: 1, trace: 1, perf: 0, heap: 0, lighthouse: 0,
   phone: 0, desktop: 0, dark: 0, light: 0, shot: 0, read: 0, look: 0, back: 0, reload: 0, console: 0, cookies: 0, storage: 0, a11y: 0,
 }
 
@@ -63,6 +65,10 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
                        a type (fetch, xhr, document, script…) or a status (404, failed); "" for all
   response FILTER      the latest response whose URL holds FILTER: status, headers and body (2,000 characters)
   cookies              the page's cookies (name, domain, flags, value length; values never printed)
+  cookie NAME VALUE    set a cookie for the current page's site through the browser (not document.cookie), so
+                       it can replace an httpOnly one, whose flags it keeps; the value is never printed
+  clear-cookies [DOMAIN]  delete all cookies, or those of DOMAIN and its subdomains (the profile is shared, so
+                       this signs every session out of that site)
   storage              localStorage and sessionStorage keys with their values clipped
   a11y                 the accessibility tree of the page (roles and names, 3,000 characters)
   perf                 load timings (TTFB, DOMContentLoaded, load, LCP, CLS), script and layout time since the run
@@ -142,6 +148,14 @@ export function parseSteps(words: readonly string[]): Step[] {
       case 'see': case 'nosee': steps.push({ verb, claim: args[0]! }); break
       case 'eval': steps.push({ verb, script: args[0]! }); break
       case 'ignore': steps.push({ verb, pattern: args[0]! }); break
+      case 'cookie': steps.push({ verb, name: args[0]!, value: args[1]! }); break
+      case 'clear-cookies': {
+        // An optional domain: the next word, when it looks like one and is not a step.
+        const d = words[i]
+        if (d !== undefined && !(d in VERB_ARITY) && /^\.?[a-z0-9-]+(\.[a-z0-9-]+)*$/i.test(d)) { steps.push({ verb, domain: d }); i++ }
+        else steps.push({ verb })
+        break
+      }
       case 'network': case 'response': steps.push({ verb, filter: args[0]! }); break
       case 'wait': {
         const n = Number(args[0])
@@ -178,6 +192,8 @@ export function stepLabel(s: Step): string {
     case 'see': case 'nosee': return `${s.verb} ${q(s.claim)}`
     case 'eval': return `eval ${q(s.script)}`
     case 'ignore': return `ignore ${q(s.pattern)}`
+    case 'cookie': return `cookie ${q(s.name)} (value ${s.value.length} chars)`
+    case 'clear-cookies': return s.domain ? `clear-cookies ${q(s.domain)}` : 'clear-cookies'
     case 'network': case 'response': return `${s.verb} ${q(s.filter)}`
     default: return s.verb
   }

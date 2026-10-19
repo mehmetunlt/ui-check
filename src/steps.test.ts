@@ -148,3 +148,11 @@ test('page errors fail unless the document loaded with a 2xx and the page render
   assert.equal(pageErrorsFail({ ...ok, textChars: 0, text: '', media: 2 }), false)
   assert.equal(pageErrorsFail({ ...ok, text: 'Application error: a client-side exception has occurred (see the browser console)' }), true)
 })
+
+test('cookie and clear-cookies parse; a domain after clear-cookies is optional; the value is never shown', () => {
+  assert.deepEqual(parseSteps(['cookie', 'sid', 's3cret', 'clear-cookies', 'example.com', 'clear-cookies', 'open', '/', 'clear-cookies']), [
+    { verb: 'cookie', name: 'sid', value: 's3cret' }, { verb: 'clear-cookies', domain: 'example.com' }, { verb: 'clear-cookies' }, { verb: 'open', target: '/' }, { verb: 'clear-cookies' },
+  ])
+  assert.equal(stepLabel({ verb: 'cookie', name: 'sid', value: 's3cret' }), 'cookie "sid" (value 6 chars)')
+  assert.equal(stepLabel({ verb: 'clear-cookies', domain: '.example.com' }), 'clear-cookies ".example.com"')
+})

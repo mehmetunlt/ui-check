@@ -631,6 +631,25 @@ async function run(page: Page, s: Step): Promise<Outcome> {
       const rows = cookies.map((c) => `${c.name}  ${c.domain}${c.path}  ${[c.httpOnly && 'httpOnly', c.secure && 'secure', c.sameSite].filter(Boolean).join(' ')}  ${c.expires > 0 ? `expires ${new Date(c.expires * 1000).toISOString().slice(0, 10)}` : 'session'}  value ${c.value.length} chars`)
       return { ok: true, print: rows.length ? rows.join('\n') : '(no cookies for this page)' }
     }
+    case 'cookie': {
+      const url = page.url()
+      if (!/^https?:/.test(url)) return { ok: false, note: 'open a page first' }
+      const ctx = page.context()
+      const same = (await ctx.cookies(url)).find((c) => c.name === s.name)
+      if (same) {
+        await ctx.addCookies([{ ...same, value: s.value }])
+        return { ok: true, note: `replaced the one for ${same.domain}${same.path}${same.httpOnly ? ', httpOnly' : ''}` }
+      }
+      await ctx.addCookies([{ name: s.name, value: s.value, url: `${new URL(url).origin}/`, sameSite: 'Lax' }])
+      return { ok: true, note: `set for ${new URL(url).host}` }
+    }
+    case 'clear-cookies': {
+      const ctx = page.context()
+      const domain = s.domain ? new RegExp(`(^|\\.)${s.domain.replace(/^\./, '').replace(/[.]/g, '\\.')}$`, 'i') : undefined
+      const n = (await ctx.cookies()).filter((c) => !domain || domain.test(c.domain)).length
+      await ctx.clearCookies(domain ? { domain } : undefined)
+      return { ok: true, note: `${n} cleared` }
+    }
     case 'storage': return { ok: true, print: JSON.stringify(await page.evaluate(STORAGE_JS), null, 2) }
     case 'a11y': {
       const tree = await page.locator('body').ariaSnapshot({ timeout: 8_000 })
