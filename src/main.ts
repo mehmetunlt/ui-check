@@ -137,6 +137,35 @@ async function closeOwnTab(m: Mode): Promise<boolean> {
   return true
 }
 
+/**
+ * Tabs no session owns any more (a run killed mid-way, a session gone) pile up, and connecting attaches to every tab:
+ * one hung orphan stalls every session's connect until it times out. Close them first, over Chrome's HTTP endpoint and
+ * under the registry lock, so a tab another session is registering is never taken.
+ */
+async function pruneOrphanTabs(): Promise<void> {
+  const base = `http://127.0.0.1:${mode.port}`
+  const release = await acquireLock(`${mode.sessions}.lock`, 15_000)
+  try {
+    const owned = new Set(Object.values(readRegistry(mode.sessions)).map((e) => e.target))
+    const list = (await (await fetch(`${base}/json/list`, { signal: AbortSignal.timeout(4_000) })).json()) as Array<{ id: string; type: string; url: string; webSocketDebuggerUrl?: string }>
+    const pages = list.filter((t) => t.type === 'page')
+    // A frozen tab (its renderer stopped answering) stalls the attach as surely as an orphan does; its session gets a
+    // fresh tab on its next run.
+    const answers = (t: { webSocketDebuggerUrl?: string }) => new Promise<boolean>((done) => {
+      if (!t.webSocketDebuggerUrl) return done(true)
+      const ws = new WebSocket(t.webSocketDebuggerUrl)
+      const stop = setTimeout(() => { try { ws.close() } catch {} done(false) }, 3_000)
+      ws.onopen = () => ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: '1' } }))
+      ws.onmessage = () => { clearTimeout(stop); try { ws.close() } catch {} done(true) }
+      ws.onerror = () => { clearTimeout(stop); done(true) }
+    })
+    const frozen = (await Promise.all(pages.map(async (t) => ((await answers(t)) ? null : t)))).filter((t): t is (typeof pages)[number] => !!t)
+    const orphans = [...pages.filter((t) => !owned.has(t.id)), ...frozen.filter((t) => owned.has(t.id))]
+    // Keep one page so Chrome stays up when nothing is registered yet.
+    for (const t of orphans.slice(owned.size ? 0 : 1)) await fetch(`${base}/json/close/${t.id}`, { signal: AbortSignal.timeout(3_000) }).catch(() => {})
+  } catch {} finally { release() }
+}
+
 async function targetId(p: Page): Promise<string> {
   const s = await p.context().newCDPSession(p)
   try { return (await s.send('Target.getTargetInfo')).targetInfo.targetId } finally { await s.detach().catch(() => {}) }
@@ -163,7 +192,7 @@ async function sessionPage(browser: Browser): Promise<Page> {
     // back: the scheme its own session chose, else none (the system's).
     for (const p of pages) {
       const key = Object.keys(reg).find((k) => reg[k]!.target === ids[pages.indexOf(p)])
-      await p.emulateMedia({ colorScheme: (key && reg[key]!.scheme) || null }).catch(() => {})
+      await Promise.race([p.emulateMedia({ colorScheme: (key && reg[key]!.scheme) || null }), sleep(1_500)]).catch(() => {})
     }
     if (!pages.includes(page)) await page.emulateMedia({ colorScheme: reg[SESSION]?.scheme ?? null }).catch(() => {})
     return page
@@ -803,6 +832,7 @@ async function main(): Promise<void> {
   process.on('exit', releaseTab)
   for (const [sig, n] of [['SIGINT', 2], ['SIGTERM', 15], ['SIGHUP', 1]] as const) process.on(sig, () => process.exit(128 + n))
   await ensureChrome()
+  await pruneOrphanTabs()
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${mode.port}`)
   const page = await sessionPage(browser)
   trackRequests(page)
