@@ -101,7 +101,8 @@ export async function acquireLock(file: string, waitMs: number, onWait?: (pid: n
   }
 }
 
-export type Registry = Record<string, { target: string; used: number }>
+/** `scheme`: the colour scheme a session's `dark` or `light` step set on its own tab (kept across runs). */
+export type Registry = Record<string, { target: string; used: number; scheme?: 'dark' | 'light' }>
 
 export function readRegistry(file: string): Registry {
   try { return JSON.parse(readFileSync(file, 'utf8')) as Registry } catch { return {} }

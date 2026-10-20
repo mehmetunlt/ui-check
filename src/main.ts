@@ -156,9 +156,26 @@ async function sessionPage(browser: Browser): Promise<Page> {
     for (const k of Object.keys(reg)) if (!pageOf(k)) delete reg[k]
     let page = pageOf(SESSION)
     if (!page) page = await ctx.newPage()
-    reg[SESSION] = { target: await targetId(page), used: now }
+    reg[SESSION] = { target: await targetId(page), used: now, ...(reg[SESSION]?.scheme ? { scheme: reg[SESSION].scheme } : {}) }
     writeRegistry(mode.sessions, reg)
+    // Connecting over CDP makes Playwright emulate a light colour scheme on every tab it attaches to, so another
+    // session's page would flip to light mid-run (a tester saw the app's theme change between pages). Put each tab
+    // back: the scheme its own session chose, else none (the system's).
+    for (const p of pages) {
+      const key = Object.keys(reg).find((k) => reg[k]!.target === ids[pages.indexOf(p)])
+      await p.emulateMedia({ colorScheme: (key && reg[key]!.scheme) || null }).catch(() => {})
+    }
+    if (!pages.includes(page)) await page.emulateMedia({ colorScheme: reg[SESSION]?.scheme ?? null }).catch(() => {})
     return page
+  } finally { release() }
+}
+
+/** A `dark` or `light` step: kept for this session's tab, so another session connecting later puts it back. */
+async function rememberScheme(scheme: 'dark' | 'light'): Promise<void> {
+  const release = await acquireLock(`${mode.sessions}.lock`, 15_000)
+  try {
+    const reg = readRegistry(mode.sessions)
+    if (reg[SESSION]) { reg[SESSION]!.scheme = scheme; writeRegistry(mode.sessions, reg) }
   } finally { release() }
 }
 
@@ -725,7 +742,7 @@ async function run(page: Page, s: Step): Promise<Outcome> {
     }
     case 'phone': await page.setViewportSize(PHONE); await sleep(300); return { ok: true }
     case 'desktop': await page.setViewportSize(DESKTOP); await sleep(300); return { ok: true }
-    case 'dark': case 'light': await page.emulateMedia({ colorScheme: s.verb }); await sleep(300); return { ok: true }
+    case 'dark': case 'light': await page.emulateMedia({ colorScheme: s.verb }); await rememberScheme(s.verb); await sleep(300); return { ok: true }
     case 'shot': return { ok: true, note: await saveShot(page, 'shot') }
     case 'read': return { ok: true, print: (await visibleText(page)).slice(0, 2_000) }
     case 'eval': {
