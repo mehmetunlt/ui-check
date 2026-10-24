@@ -385,7 +385,12 @@ const DEV_OVERLAYS_JS = `({
 async function saveShot(page: Page, why: string): Promise<string> {
   mkdirSync(SHOTS, { recursive: true })
   const file = join(SHOTS, `${new Date().toISOString().replace(/[:.]/g, '-')}-${++shotN}-${why}.jpg`)
-  await page.screenshot({ path: file, type: 'jpeg', quality: 70 })
+  // At a `scale` above 1 Playwright still captures at CSS size (it does not know the override), so the session that set
+  // it captures device pixels itself.
+  if (scaleSession) {
+    const { data } = await scaleSession.send('Page.captureScreenshot', { format: 'jpeg', quality: 80 })
+    writeFileSync(file, Buffer.from(data, 'base64'))
+  } else await page.screenshot({ path: file, type: 'jpeg', quality: 70 })
   return file
 }
 
