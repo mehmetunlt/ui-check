@@ -31,6 +31,7 @@ import { settleForLook, trackRequests } from './settle.ts'
 import {
   LOOK_QUESTIONS, NEXT_DEV_SELECTORS, SEE_ID, USAGE, bestCandidate, devOverlayStyle, ignoredBy, judgeWithRetry, pageErrorsFail, tidyText, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
   rankMatches, resolveUrl, seeQuestion, seeVerdict, splitOrdinal, stepLabel, type Candidate, type MatchInfo, type Step,
+  DEVICES, isDevice,
 } from './steps.ts'
 import { acquireLock, activeSessions, callerId, listProcs, lockHolder, projectRoot, readRegistry, sessionKey, staleSessions, writeRegistry } from './session.ts'
 
@@ -45,8 +46,7 @@ const MODES: Record<'shown' | 'hidden', Mode> = {
 }
 const SHOTS = join(tmpdir(), 'agents-ui-check')
 const CHROME = [process.env.CHROME_PATH, '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/google-chrome'].find((p) => p && existsSync(p))
-const DESKTOP = { width: 1280, height: 800 }
-const PHONE = { width: 390, height: 844 }
+const DESKTOP = DEVICES.desktop
 const TEXT_CHARS = 4_000
 const CLICK_ROLES = ['button', 'link', 'tab', 'menuitem', 'option', 'checkbox', 'radio', 'switch', 'treeitem'] as const
 const FIELD_ROLES = ['textbox', 'searchbox', 'combobox', 'spinbutton'] as const
@@ -76,8 +76,8 @@ const tabLocked = (m: Mode) => (key: string) => lockHolder(tabLock(m, key)) !== 
 
 if (close && words.length === 0) {
   for (const m of [MODES.shown, MODES.hidden]) {
-    const tab = existsSync(m.pidFile) && activeSessions(readRegistry(m.sessions), SESSION, Date.now(), tabLocked(m)).length ? await closeOwnTab(m) : false
-    stopUnlessShared(m, tab)
+    const tab = (await portUp(m)) && activeSessions(readRegistry(m.sessions), SESSION, Date.now(), tabLocked(m)).length ? await closeOwnTab(m) : false
+    await stopUnlessShared(m, tab)
   }
   process.exit(0)
 }
@@ -87,9 +87,17 @@ try { steps = parseSteps(words) } catch (e) { console.error((e as Error).message
 if (steps.length === 0) { console.log(USAGE); process.exit(2) }
 
 // ── Chrome ───────────────────────────────────────────────────────────────────
-async function endpointUp(): Promise<boolean> {
-  try { return (await fetch(`http://127.0.0.1:${mode.port}/json/version`, { signal: AbortSignal.timeout(800) })).ok } catch { return false }
+async function portUp(m: Mode): Promise<boolean> {
+  try { return (await fetch(`http://127.0.0.1:${m.port}/json/version`, { signal: AbortSignal.timeout(800) })).ok } catch { return false }
 }
+const endpointUp = () => portUp(mode)
+
+/**
+ * Headless Chrome on a machine with no mouse reports no pointer and no hover, so `(hover: hover)` and
+ * `(pointer: fine)` rules never applied in a desktop check. This tells Blink there is a mouse (fine pointer, hover);
+ * phones and tablets turn touch on over it (setWindow).
+ */
+const MOUSE = '--blink-settings=primaryPointerType=4,availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2'
 
 async function ensureChrome(): Promise<void> {
   if (await endpointUp()) return
@@ -97,7 +105,7 @@ async function ensureChrome(): Promise<void> {
   mkdirSync(mode.profile, { recursive: true })
   const child = spawn(CHROME, [
     `--remote-debugging-port=${mode.port}`, `--user-data-dir=${mode.profile}`, '--no-first-run', '--no-default-browser-check',
-    ...(mode.headless ? ['--headless=new', '--hide-scrollbars', '--window-size=1280,800'] : ['--window-size=1300,940']), 'about:blank',
+    ...(mode.headless ? ['--headless=new', '--hide-scrollbars', '--window-size=1280,800', MOUSE] : ['--window-size=1300,940']), 'about:blank',
   ], { detached: true, stdio: 'ignore' })
   child.unref()
   writeFileSync(mode.pidFile, String(child.pid))
@@ -108,21 +116,35 @@ async function ensureChrome(): Promise<void> {
   throw new Error(`Chrome did not open its debug port ${mode.port}`)
 }
 
-function stopChrome(m: Mode): void {
+/**
+ * Stops the mode's Chrome through its debug port (Browser.close), so it works when the pid file is gone or names the
+ * launcher's pid; the pid is the fallback for a Chrome whose port no longer answers.
+ */
+async function stopChrome(m: Mode): Promise<void> {
   const which = m.headless ? 'hidden' : 'visible'
-  if (!existsSync(m.pidFile)) { console.log(`no ${which} ui-check Chrome is running`); return }
-  const pid = Number(readFileSync(m.pidFile, 'utf8'))
-  try { process.kill(pid, 'SIGTERM'); console.log(`stopped the ${which} ui-check Chrome (pid ${pid})`) } catch { console.log(`the ${which} ui-check Chrome was not running`) }
+  let stopped = false
+  if (await portUp(m)) {
+    try {
+      const b = await chromium.connectOverCDP(`http://127.0.0.1:${m.port}`, { timeout: 5_000 })
+      await (await b.newBrowserCDPSession()).send('Browser.close').catch(() => {})
+      stopped = true
+    } catch {}
+  }
+  if (!stopped && existsSync(m.pidFile)) {
+    const pid = Number(readFileSync(m.pidFile, 'utf8'))
+    try { process.kill(pid, 'SIGTERM'); stopped = true } catch {}
+  }
+  console.log(stopped ? `stopped the ${which} ui-check Chrome` : `no ${which} ui-check Chrome is running`)
   rmSync(m.pidFile, { force: true })
   rmSync(m.sessions, { force: true })
 }
 
 /** --close: Chrome stops unless other sessions are using it (a run going, or one in the last minutes). */
-function stopUnlessShared(m: Mode, closedTab: boolean): void {
+async function stopUnlessShared(m: Mode, closedTab: boolean): Promise<void> {
   const others = activeSessions(readRegistry(m.sessions), SESSION, Date.now(), tabLocked(m))
-  if (others.length && existsSync(m.pidFile)) {
+  if (others.length && await portUp(m)) {
     console.log(`${closedTab ? "closed this session's tab; " : ''}left the ${m.headless ? 'hidden' : 'visible'} ui-check Chrome running: ${others.length} other ${others.length === 1 ? 'session uses' : 'sessions use'} it`)
-  } else stopChrome(m)
+  } else await stopChrome(m)
 }
 
 /** --close on its own, while other sessions keep Chrome: just this session's tab goes. */
@@ -631,7 +653,39 @@ async function evaluate(page: Page, script: string): Promise<unknown> {
 // ── steps ────────────────────────────────────────────────────────────────────
 type Outcome = { ok: boolean; note?: string; print?: string }
 
+/**
+ * The window size, and touch for phones and tablets: CDP's touch emulation gives the page touch events, one touch
+ * point and the coarse-pointer, no-hover media a real device reports. Its session is kept for the run (a detached
+ * session drops the override).
+ */
+let touchSession: CDPSession | null = null
+let touchOn = false
+/** True when it left a touch size and so reloaded the page. */
+async function setWindow(page: Page, width: number, height: number, touch: boolean): Promise<boolean> {
+  await page.setViewportSize({ width, height })
+  const leavingTouch = !touch && touchOn
+  if (touch) {
+    touchSession ??= await page.context().newCDPSession(page)
+    await touchSession.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 }).catch(() => {})
+  } else if (touchSession) {
+    // Detaching drops the session's overrides; turning touch off on it left the pointer coarse.
+    await touchSession.send('Emulation.setTouchEmulationEnabled', { enabled: false }).catch(() => {})
+    await touchSession.detach().catch(() => {})
+    touchSession = null
+  }
+  touchOn = touch
+  // Chrome keeps reporting a coarse pointer and no hover after touch goes off, until the page loads again.
+  if (leavingTouch && /^https?:/.test(page.url())) { await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {}); await settle(page) }
+  else await sleep(300)
+  return leavingTouch
+}
+
 async function run(page: Page, s: Step): Promise<Outcome> {
+  if (isDevice(s.verb)) {
+    const d = DEVICES[s.verb]
+    const reloaded = await setWindow(page, d.width, d.height, d.touch)
+    return { ok: true, note: `${d.width}x${d.height}${d.touch ? ', touch' : ''}${reloaded ? ', page reloaded to leave touch' : ''}` }
+  }
   switch (s.verb) {
     case 'open': {
       const res = await page.goto(resolveUrl(s.target, base), { waitUntil: 'domcontentloaded', timeout: 30_000 })
@@ -769,8 +823,11 @@ async function run(page: Page, s: Step): Promise<Outcome> {
       await sleep(300)
       return { ok: true }
     }
-    case 'phone': await page.setViewportSize(PHONE); await sleep(300); return { ok: true }
-    case 'desktop': await page.setViewportSize(DESKTOP); await sleep(300); return { ok: true }
+    case 'size': {
+      const reloaded = await setWindow(page, s.width, s.height, s.touch ?? false)
+      return { ok: true, note: `${s.width}x${s.height}${s.touch ? ', touch' : ''}${reloaded ? ', page reloaded to leave touch' : ''}` }
+    }
+    case 'motion': await page.emulateMedia({ reducedMotion: s.reduce ? 'reduce' : 'no-preference' }); await sleep(300); return { ok: true }
     case 'dark': case 'light': await page.emulateMedia({ colorScheme: s.verb }); await rememberScheme(s.verb); await sleep(300); return { ok: true }
     case 'shot': return { ok: true, note: await saveShot(page, 'shot') }
     case 'read': return { ok: true, print: (await visibleText(page)).slice(0, 2_000) }
@@ -841,6 +898,9 @@ async function main(): Promise<void> {
   await metrics(page).catch(() => {})
   if (show) await page.bringToFront().catch(() => {})
   await page.setViewportSize(DESKTOP)
+  if (mode.headless && !(await page.evaluate('matchMedia("(hover: hover)").matches').catch(() => true))) {
+    infos.push('this hidden Chrome was started without a mouse, so hover styles are off: run "ui-check --close" when no other session is checking, and the next run starts it with one')
+  }
   const origin = () => { try { return new URL(base).origin } catch { return '' } }
   page.on('pageerror', (e) => {
     pageErrors.push(e.message.split('\n')[0]!.slice(0, 200))
@@ -916,7 +976,7 @@ async function main(): Promise<void> {
   if (close) {
     await page.close().catch(() => {})
     await forgetSession(mode)
-    stopUnlessShared(mode, true)
+    await stopUnlessShared(mode, true)
   }
 }
 

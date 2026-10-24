@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { bestCandidate, devOverlayStyle, judgeWithRetry, tidyText, ignoredBy, pageErrorsFail, dialogPolicy, isSelector, lighthouseSummary, lookFails, lookProblems, parseSteps, planWords, rankMatches, resolveUrl, seeVerdict, splitOrdinal, stepLabel, tokenize, type MatchInfo } from './steps.ts'
+import { DEVICES, isDevice, bestCandidate, devOverlayStyle, judgeWithRetry, tidyText, ignoredBy, pageErrorsFail, dialogPolicy, isSelector, lighthouseSummary, lookFails, lookProblems, parseSteps, planWords, rankMatches, resolveUrl, seeVerdict, splitOrdinal, stepLabel, tokenize, type MatchInfo } from './steps.ts'
 
 test('tokenize keeps quoted words whole and stops at a comment', () => {
   assert.deepEqual(tokenize(`fill "Message" 'hi there'  # say hi`), ['fill', 'Message', 'hi there'])
@@ -182,4 +182,26 @@ test('a failed see is asked again once, after the page settles', async () => {
   assert.deepEqual(await judgeWithRetry('nosee', answers([0.8, 0.7]), settle), { ok: false, note: 'p 0.80, then p 0.70 after the page settled' })
   assert.deepEqual(await judgeWithRetry('see', answers([null]), settle), { ok: false, note: 'no answer from the classifier' })
   assert.equal(settled, 2)
+})
+
+test('device names, size and motion parse into their steps', () => {
+  const steps = parseSteps(planWords('phone-small\ntablet\ntablet-landscape\nlaptop\nwide\nqhd\nsize 1600x1000\nsize 900x1200 touch\nmotion reduce\nmotion normal\n'))
+  assert.deepEqual(steps, [
+    { verb: 'phone-small' }, { verb: 'tablet' }, { verb: 'tablet-landscape' }, { verb: 'laptop' }, { verb: 'wide' }, { verb: 'qhd' },
+    { verb: 'size', width: 1600, height: 1000 }, { verb: 'size', width: 900, height: 1200, touch: true },
+    { verb: 'motion', reduce: true }, { verb: 'motion', reduce: false },
+  ])
+  assert.equal(stepLabel({ verb: 'size', width: 900, height: 1200, touch: true }), 'size 900x1200 touch')
+  assert.throws(() => parseSteps(['size', '1920']), /WIDTHxHEIGHT/)
+  assert.throws(() => parseSteps(['size', '100x100']), /200 or more/)
+  assert.throws(() => parseSteps(['motion', 'off']), /reduce or normal/)
+})
+
+test('every device is a real size, phones and tablets with touch', () => {
+  for (const [name, d] of Object.entries(DEVICES)) {
+    assert.ok(d.width >= 320 && d.height >= 320, name)
+    assert.equal(d.touch, d.width < 1200 && name !== 'desktop', name)
+  }
+  assert.deepEqual([DEVICES.wide.width, DEVICES.wide.height], [1920, 1080])
+  assert.ok(isDevice('tablet') && !isDevice('toString'))
 })

@@ -4,6 +4,25 @@
  */
 import type { QuickQuestion } from './classifier/quick-check.ts'
 
+/**
+ * The window sizes a check can take, by name: current phones, tablets and monitors. Phones and tablets also turn on
+ * touch (one finger, coarse pointer, no hover), so touch-only layouts and 44 px target rules show as on the device.
+ * Sizes are CSS pixels (the device's viewport, not its panel).
+ */
+export const DEVICES = {
+  'phone-small': { width: 360, height: 780, touch: true, note: 'a small Android phone' },
+  phone: { width: 390, height: 844, touch: true, note: 'a standard iPhone' },
+  'phone-large': { width: 430, height: 932, touch: true, note: 'a large iPhone' },
+  tablet: { width: 820, height: 1180, touch: true, note: 'an iPad Air, upright' },
+  'tablet-landscape': { width: 1180, height: 820, touch: true, note: 'an iPad Air, on its side' },
+  desktop: { width: 1280, height: 800, touch: false, note: 'a small laptop (the default)' },
+  laptop: { width: 1440, height: 900, touch: false, note: 'a 14 to 15 inch laptop' },
+  wide: { width: 1920, height: 1080, touch: false, note: 'a 1080p monitor' },
+  qhd: { width: 2560, height: 1440, touch: false, note: 'a 1440p monitor' },
+} as const satisfies Record<string, { width: number; height: number; touch: boolean; note: string }>
+export type DeviceName = keyof typeof DEVICES
+export const isDevice = (verb: string): verb is DeviceName => Object.hasOwn(DEVICES, verb)
+
 export type Step =
   | { verb: 'open'; target: string }
   | { verb: 'click' | 'hover'; target: string; nth?: number }
@@ -22,13 +41,15 @@ export type Step =
   | { verb: 'clear-cookies'; domain?: string }
   | { verb: 'network'; filter: string }
   | { verb: 'response'; filter: string }
-  | { verb: 'phone' | 'desktop' | 'dark' | 'light' | 'shot' | 'read' | 'look' | 'back' | 'reload' | 'console' | 'cookies' | 'storage' | 'a11y' | 'perf' | 'heap' | 'lighthouse' }
+  | { verb: 'size'; width: number; height: number; touch?: boolean }
+  | { verb: 'motion'; reduce: boolean }
+  | { verb: DeviceName | 'dark' | 'light' | 'shot' | 'read' | 'look' | 'back' | 'reload' | 'console' | 'cookies' | 'storage' | 'a11y' | 'perf' | 'heap' | 'lighthouse' }
 
 /** How many words each verb takes after it. */
 export const VERB_ARITY: Record<Step['verb'], number> = {
   open: 1, click: 1, hover: 1, fill: 2, select: 2, press: 1, wait: 1, see: 1, nosee: 1, scroll: 1, eval: 1,
   network: 1, response: 1, ignore: 1, cookie: 2, 'clear-cookies': 0, drag: 2, upload: 2, dialog: 1, trace: 1, perf: 0, heap: 0, lighthouse: 0,
-  phone: 0, desktop: 0, dark: 0, light: 0, shot: 0, read: 0, look: 0, back: 0, reload: 0, console: 0, cookies: 0, storage: 0, a11y: 0,
+  size: 1, motion: 1, ...(Object.fromEntries(Object.keys(DEVICES).map((d) => [d, 0])) as Record<DeviceName, 0>), dark: 0, light: 0, shot: 0, read: 0, look: 0, back: 0, reload: 0, console: 0, cookies: 0, storage: 0, a11y: 0,
 }
 
 export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--close] <steps…>
@@ -56,7 +77,11 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
   look                 the classifier's health look: error, blank or stuck, broken layout (the Next.js dev
                        indicator is hidden for it, unless its error dialog is open)
   scroll down|up|TEXT  scroll a screen, or to TEXT
-  phone | desktop      390x844 or 1280x800
+  phone-small | phone | phone-large   360x780, 390x844, 430x932, with touch
+  tablet | tablet-landscape           820x1180 or 1180x820, with touch
+  desktop | laptop | wide | qhd       1280x800 (the default), 1440x900, 1920x1080 (1080p), 2560x1440
+  size WxH [touch]     any window size, e.g. size 1600x1000; "touch" after it turns touch on
+  motion reduce|normal prefers-reduced-motion for the page, from here on
   dark | light         colour scheme
   read                 print the page's visible text (first 2,000 characters)
   shot                 save a screenshot and print its path
@@ -161,6 +186,18 @@ export function parseSteps(words: readonly string[]): Step[] {
         break
       }
       case 'network': case 'response': steps.push({ verb, filter: args[0]! }); break
+      case 'size': {
+        const m = /^(\d{3,4})x(\d{3,4})$/.exec(args[0]!)
+        if (!m || Number(m[1]) < 200 || Number(m[2]) < 200) throw new Error(`"size" needs WIDTHxHEIGHT, each 200 or more, e.g. 1920x1080 (got "${args[0]}")`)
+        const touch = words[i] === 'touch'
+        if (touch) i++
+        steps.push({ verb, width: Number(m[1]), height: Number(m[2]), ...(touch ? { touch } : {}) })
+        break
+      }
+      case 'motion':
+        if (args[0] !== 'reduce' && args[0] !== 'normal') throw new Error(`"motion" needs reduce or normal (got "${args[0]}")`)
+        steps.push({ verb, reduce: args[0] === 'reduce' })
+        break
       case 'wait': {
         const n = Number(args[0])
         steps.push(Number.isFinite(n) && args[0]!.trim() !== '' ? { verb, seconds: n } : { verb, text: args[0]! })
@@ -192,6 +229,8 @@ export function stepLabel(s: Step): string {
     case 'dialog': return `dialog ${q(s.answer)}`
     case 'trace': return `trace ${s.action}`
     case 'press': return `press ${s.key}`
+    case 'size': return `size ${s.width}x${s.height}${s.touch ? ' touch' : ''}`
+    case 'motion': return `motion ${s.reduce ? 'reduce' : 'normal'}`
     case 'wait': return 'seconds' in s ? `wait ${s.seconds}s` : `wait ${q(s.text)}`
     case 'see': case 'nosee': return `${s.verb} ${q(s.claim)}`
     case 'eval': return `eval ${q(s.script)}`

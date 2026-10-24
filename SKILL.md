@@ -33,7 +33,9 @@ Run `ui-check --help` for the whole list. The main steps:
 - `look`: health check of the screen: an error screen fails; blank, stuck loading or broken layout warn. The Next.js dev indicator is hidden from its screenshot (unless the Next error dialog is open), and a Vite error overlay only when the run saw no error.
 - A step that navigates (a click, `press Enter`, `select`) ends its line with where the page went: `-> http://localhost:3000/dashboard`.
 - `select` also drives custom dropdowns (React selects, comboboxes, plain div menus): it opens the control, types OPTION into its search box when one shows, and clicks the option by its name or text, falling back to the classifier's pick as `click` does.
-- `wait SECONDS|TEXT`, `press KEY`, `scroll down|up|TEXT`, `phone`, `desktop`, `dark`, `light`, `back`, `reload`.
+- `wait SECONDS|TEXT`, `press KEY`, `scroll down|up|TEXT`, `dark`, `light`, `back`, `reload`.
+- Window sizes (CSS pixels): phones `phone-small` 360x780, `phone` 390x844, `phone-large` 430x932 and tablets `tablet` 820x1180, `tablet-landscape` 1180x820, all with touch (coarse pointer, no hover); monitors `desktop` 1280x800 (each run starts here), `laptop` 1440x900, `wide` 1920x1080 (a 1080p monitor), `qhd` 2560x1440, with a mouse (fine pointer, hover). `size WxH [touch]` for any other. Going from a touch size to a mouse size reloads the page, since Chrome keeps the touch media until a load. Judge desktop layouts at `wide` or `laptop`: 1280 is a small laptop.
+- `motion reduce|normal`: prefers-reduced-motion from here on, to check that motion has a still alternative.
 - `drag FROM TO`: drags one element onto another (HTML5 drag and drop works); each is found as `click` finds it, or by its text.
 - `upload TARGET FILE`: into the file field TARGET names, or through the picker the control TARGET opens (a hidden input works); falls back to the page's first file input.
 - `dialog accept|dismiss|TEXT`: how alert, confirm and prompt dialogs are answered from that step on (TEXT answers a prompt). Without it every dialog is dismissed, so a "Delete everything?" confirm never goes through by accident. Each dialog prints an `info` line.
