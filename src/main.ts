@@ -664,8 +664,12 @@ type Outcome = { ok: boolean; note?: string; print?: string }
  */
 let touchSession: CDPSession | null = null
 let touchOn = false
+/** The session holding a `scale` override: detaching it would drop the override, so it is kept for the run. */
+let scaleSession: CDPSession | null = null
 /** True when it left a touch size and so reloaded the page. */
 async function setWindow(page: Page, width: number, height: number, touch: boolean): Promise<boolean> {
+  // A size step ends a `scale`: dropping its session drops the override.
+  if (scaleSession) { await scaleSession.detach().catch(() => {}); scaleSession = null }
   await page.setViewportSize({ width, height })
   const leavingTouch = !touch && touchOn
   if (touch) {
@@ -830,6 +834,16 @@ async function run(page: Page, s: Step): Promise<Outcome> {
     case 'size': {
       const reloaded = await setWindow(page, s.width, s.height, s.touch ?? false)
       return { ok: true, note: `${s.width}x${s.height}${s.touch ? ', touch' : ''}${reloaded ? ', page reloaded to leave touch' : ''}` }
+    }
+    case 'scale': {
+      // The device pixel ratio on top of the current size; Playwright's next size change sets it back to 1.
+      const vp = page.viewportSize() ?? DESKTOP
+      const cdp = await page.context().newCDPSession(page)
+      await cdp.send('Emulation.setDeviceMetricsOverride', { width: vp.width, height: vp.height, deviceScaleFactor: s.factor, mobile: touchOn })
+      scaleSession?.detach().catch(() => {})
+      scaleSession = cdp
+      await sleep(300)
+      return { ok: true, note: `${vp.width}x${vp.height} at ${s.factor}x` }
     }
     case 'motion': await page.emulateMedia({ reducedMotion: s.reduce ? 'reduce' : 'no-preference' }); await sleep(300); return { ok: true }
     case 'dark': case 'light': await page.emulateMedia({ colorScheme: s.verb }); await rememberScheme(s.verb); await sleep(300); return { ok: true }

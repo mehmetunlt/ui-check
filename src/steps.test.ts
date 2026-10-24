@@ -195,6 +195,8 @@ test('device names, size and motion parse into their steps', () => {
   assert.throws(() => parseSteps(['size', '1920']), /WIDTHxHEIGHT/)
   assert.throws(() => parseSteps(['size', '100x100']), /200 or more/)
   assert.throws(() => parseSteps(['motion', 'off']), /reduce or normal/)
+  assert.deepEqual(parseSteps(['scale', '2']), [{ verb: 'scale', factor: 2 }])
+  assert.throws(() => parseSteps(['scale', '4']), /1, 2 or 3/)
 })
 
 test('every device is a real size, phones and tablets with touch', () => {

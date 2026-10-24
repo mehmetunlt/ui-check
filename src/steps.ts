@@ -43,13 +43,14 @@ export type Step =
   | { verb: 'response'; filter: string }
   | { verb: 'size'; width: number; height: number; touch?: boolean }
   | { verb: 'motion'; reduce: boolean }
+  | { verb: 'scale'; factor: number }
   | { verb: DeviceName | 'dark' | 'light' | 'shot' | 'read' | 'look' | 'back' | 'reload' | 'console' | 'cookies' | 'storage' | 'a11y' | 'perf' | 'heap' | 'lighthouse' }
 
 /** How many words each verb takes after it. */
 export const VERB_ARITY: Record<Step['verb'], number> = {
   open: 1, click: 1, hover: 1, fill: 2, select: 2, press: 1, wait: 1, see: 1, nosee: 1, scroll: 1, eval: 1,
   network: 1, response: 1, ignore: 1, cookie: 2, 'clear-cookies': 0, drag: 2, upload: 2, dialog: 1, trace: 1, perf: 0, heap: 0, lighthouse: 0,
-  size: 1, motion: 1, ...(Object.fromEntries(Object.keys(DEVICES).map((d) => [d, 0])) as Record<DeviceName, 0>), dark: 0, light: 0, shot: 0, read: 0, look: 0, back: 0, reload: 0, console: 0, cookies: 0, storage: 0, a11y: 0,
+  size: 1, motion: 1, scale: 1, ...(Object.fromEntries(Object.keys(DEVICES).map((d) => [d, 0])) as Record<DeviceName, 0>), dark: 0, light: 0, shot: 0, read: 0, look: 0, back: 0, reload: 0, console: 0, cookies: 0, storage: 0, a11y: 0,
 }
 
 export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--close] <steps…>
@@ -82,6 +83,7 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
   desktop | laptop | wide | qhd       1280x800 (the default), 1440x900, 1920x1080 (1080p), 2560x1440
   size WxH [touch]     any window size, e.g. size 1600x1000; "touch" after it turns touch on
   motion reduce|normal prefers-reduced-motion for the page, from here on
+  scale 1|2|3          device pixel ratio for sharp screenshots (a retina screen), until the next size step
   dark | light         colour scheme
   read                 print the page's visible text (first 2,000 characters)
   shot                 save a screenshot and print its path
@@ -194,6 +196,12 @@ export function parseSteps(words: readonly string[]): Step[] {
         steps.push({ verb, width: Number(m[1]), height: Number(m[2]), ...(touch ? { touch } : {}) })
         break
       }
+      case 'scale': {
+        const f = Number(args[0])
+        if (!(f === 1 || f === 2 || f === 3)) throw new Error(`"scale" needs 1, 2 or 3 (got "${args[0]}")`)
+        steps.push({ verb, factor: f })
+        break
+      }
       case 'motion':
         if (args[0] !== 'reduce' && args[0] !== 'normal') throw new Error(`"motion" needs reduce or normal (got "${args[0]}")`)
         steps.push({ verb, reduce: args[0] === 'reduce' })
@@ -231,6 +239,7 @@ export function stepLabel(s: Step): string {
     case 'press': return `press ${s.key}`
     case 'size': return `size ${s.width}x${s.height}${s.touch ? ' touch' : ''}`
     case 'motion': return `motion ${s.reduce ? 'reduce' : 'normal'}`
+    case 'scale': return `scale ${s.factor}`
     case 'wait': return 'seconds' in s ? `wait ${s.seconds}s` : `wait ${q(s.text)}`
     case 'see': case 'nosee': return `${s.verb} ${q(s.claim)}`
     case 'eval': return `eval ${q(s.script)}`
