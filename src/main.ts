@@ -168,7 +168,11 @@ async function pruneOrphanTabs(): Promise<void> {
   const base = `http://127.0.0.1:${mode.port}`
   const release = await acquireLock(`${mode.sessions}.lock`, 15_000)
   try {
-    const owned = new Set(Object.values(readRegistry(mode.sessions)).map((e) => e.target))
+    const reg = readRegistry(mode.sessions)
+    const owned = new Set(Object.values(reg).map((e) => e.target))
+    // A tab whose session has a run going is busy, not frozen: a heavy page or a long step can hold its renderer past
+    // the 3 s probe, and closing it dropped that session mid-run (five sessions sharing one Chrome kept losing tabs).
+    const running = new Set(Object.entries(reg).filter(([k]) => k !== SESSION && tabLocked(mode)(k)).map(([, e]) => e.target))
     const list = (await (await fetch(`${base}/json/list`, { signal: AbortSignal.timeout(4_000) })).json()) as Array<{ id: string; type: string; url: string; webSocketDebuggerUrl?: string }>
     const pages = list.filter((t) => t.type === 'page')
     // A frozen tab (its renderer stopped answering) stalls the attach as surely as an orphan does; its session gets a
@@ -182,7 +186,7 @@ async function pruneOrphanTabs(): Promise<void> {
       ws.onerror = () => { clearTimeout(stop); done(true) }
     })
     const frozen = (await Promise.all(pages.map(async (t) => ((await answers(t)) ? null : t)))).filter((t): t is (typeof pages)[number] => !!t)
-    const orphans = [...pages.filter((t) => !owned.has(t.id)), ...frozen.filter((t) => owned.has(t.id))]
+    const orphans = [...pages.filter((t) => !owned.has(t.id)), ...frozen.filter((t) => owned.has(t.id) && !running.has(t.id))]
     // Keep one page so Chrome stays up when nothing is registered yet.
     for (const t of orphans.slice(owned.size ? 0 : 1)) await fetch(`${base}/json/close/${t.id}`, { signal: AbortSignal.timeout(3_000) }).catch(() => {})
   } catch {} finally { release() }
