@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { DEVICES, isDevice, bestCandidate, devOverlayStyle, judgeWithRetry, tidyText, ignoredBy, pageErrorsFail, dialogPolicy, isSelector, lighthouseSummary, lookFails, lookProblems, parseSteps, planWords, rankMatches, resolveUrl, seeVerdict, splitOrdinal, stepLabel, tokenize, type MatchInfo } from './steps.ts'
+import { DEVICES, isDevice, bestCandidate, devOverlayStyle, ignoredStatus, judgeWithRetry, statusIn, tidyText, ignoredBy, pageErrorsFail, dialogPolicy, isSelector, lighthouseSummary, lookFails, lookProblems, lookWarnNote, noMatchNote, parseSteps, planWords, rankMatches, resolveUrl, seeVerdict, splitOrdinal, stepLabel, tokenize, type MatchInfo } from './steps.ts'
 
 test('tokenize keeps quoted words whole and stops at a comment', () => {
   assert.deepEqual(tokenize(`fill "Message" 'hi there'  # say hi`), ['fill', 'Message', 'hi there'])
@@ -8,6 +8,18 @@ test('tokenize keeps quoted words whole and stops at a comment', () => {
   assert.deepEqual(tokenize('click ""'), ['click', ''])
   assert.deepEqual(tokenize('# only a comment'), [])
   assert.throws(() => tokenize('see "open'), /unclosed/)
+})
+
+test('a css=, role= or other selector word keeps its quotes and the spaces inside them', () => {
+  assert.deepEqual(tokenize('click css=[aria-label="Show details"]'), ['click', 'css=[aria-label="Show details"]'])
+  assert.deepEqual(tokenize(`click css=[aria-label='Show details']`), ['click', `css=[aria-label='Show details']`])
+  assert.deepEqual(tokenize('click role=button[name="Send now"]'), ['click', 'role=button[name="Send now"]'])
+  assert.deepEqual(tokenize('click text="two words"'), ['click', 'text="two words"'])
+  assert.deepEqual(tokenize('click "css=[aria-label=\\"Show details\\"]"'), ['click', 'css=[aria-label="Show details"]'])
+  // Outside a selector word the quotes are the shell's, as before.
+  assert.deepEqual(tokenize(`fill "Search" 'two words'`), ['fill', 'Search', 'two words'])
+  // A plan file line arrives at the page byte for byte.
+  assert.deepEqual(planWords('click css=[aria-label="Show details"]'), ['click', 'css=[aria-label="Show details"]'])
 })
 
 test('a plan file is one step per line', () => {
@@ -89,6 +101,11 @@ test('only a sure error screen fails the look', () => {
   assert.equal(lookFails([{ id: 'error', p: 0.7 }, { id: 'blank', p: 0.99 }]), false)
 })
 
+test('a look warn says what it judged and why a warn is not a failure', () => {
+  assert.equal(lookWarnNote([{ id: 'broken', p: 0.76 }]), 'WARN broken (p 0.76, a screenshot cut by the viewport reads as broken; scroll and look again)')
+  assert.equal(lookWarnNote([{ id: 'blank', p: 0.7 }, { id: 'broken', p: 0.9 }]), 'WARN broken (p 0.90, a screenshot cut by the viewport reads as broken; scroll and look again), blank (p 0.70)')
+})
+
 test('bestCandidate takes the likeliest yes', () => {
   assert.deepEqual(bestCandidate([{ item: '0', p: 0.3, value: false }, { item: '3', p: 0.8, value: true }, { item: '5', p: 0.6, value: true }]), { idx: 3, p: 0.8 })
   assert.equal(bestCandidate([{ item: '0', p: 0.4, value: false }]), null)
@@ -137,6 +154,33 @@ test('ignore parses; its pattern matches text anywhere, any case, with * as a wi
   assert.equal(ignoredBy(['/api/*/status'], '503 GET /api/v1/other'), undefined)
   assert.equal(ignoredBy(['a.b'], 'axb'), undefined)
   assert.equal(ignoredBy([], 'x'), undefined)
+})
+
+test('ignore 404 quiets what carries that status, including a resource console error', () => {
+  assert.equal(ignoredStatus(['404'], 404), '404')
+  assert.equal(ignoredStatus(['404'], 500), undefined)
+  assert.equal(ignoredStatus(['/api/*'], 404), undefined)
+  assert.equal(ignoredStatus(['404'], undefined), undefined)
+  assert.equal(statusIn('Failed to load resource: the server responded with a status of 404 (Not Found)'), 404)
+  assert.equal(statusIn('console: boom'), undefined)
+  assert.deepEqual(parseSteps(['ignore', '404', 'open', '/'])[0], { verb: 'ignore', pattern: '404' })
+})
+
+test('read takes an optional character count', () => {
+  assert.deepEqual(parseSteps(['read', 'read', '6000', 'read', 'open', '/']), [
+    { verb: 'read' }, { verb: 'read', max: 6000 }, { verb: 'read' }, { verb: 'open', target: '/' },
+  ])
+  assert.equal(stepLabel({ verb: 'read' }), 'read')
+  assert.equal(stepLabel({ verb: 'read', max: 6000 }), 'read 6000')
+})
+
+test('a click or fill that found nothing says what it looked at', () => {
+  assert.equal(noMatchNote({ considered: 12 }), 'nothing matches; looked at 12 visible controls, css=… or role=… reaches anything the words miss')
+  assert.match(noMatchNote({ considered: 0 }), /^nothing matches; no visible controls/)
+  assert.match(noMatchNote({ fields: true, considered: 3 }), /^no such field; looked at 3 visible fields, css=…/)
+  assert.equal(noMatchNote({ selector: true, considered: 1 }), 'nothing matches; the selector matched 1 element, none of them visible')
+  assert.equal(noMatchNote({ selector: true, considered: 2 }), 'nothing matches; the selector matched 2 elements, none of them visible')
+  assert.equal(noMatchNote({ selector: true, considered: 0 }), 'nothing matches; no element matches that selector')
 })
 
 test('page errors fail unless the document loaded with a 2xx and the page rendered', () => {
@@ -192,7 +236,9 @@ test('device names, size and motion parse into their steps', () => {
     { verb: 'motion', reduce: true }, { verb: 'motion', reduce: false },
   ])
   assert.equal(stepLabel({ verb: 'size', width: 900, height: 1200, touch: true }), 'size 900x1200 touch')
-  assert.throws(() => parseSteps(['size', '1920']), /WIDTHxHEIGHT/)
+  // A width alone keeps the laptop's 16:10.
+  assert.deepEqual(parseSteps(['size', '1440']), [{ verb: 'size', width: 1440, height: 900 }])
+  assert.throws(() => parseSteps(['size', 'huge']), /WIDTHxHEIGHT/)
   assert.throws(() => parseSteps(['size', '100x100']), /200 or more/)
   assert.throws(() => parseSteps(['motion', 'off']), /reduce or normal/)
   assert.deepEqual(parseSteps(['scale', '2']), [{ verb: 'scale', factor: 2 }])

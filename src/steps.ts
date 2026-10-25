@@ -44,7 +44,8 @@ export type Step =
   | { verb: 'size'; width: number; height: number; touch?: boolean }
   | { verb: 'motion'; reduce: boolean }
   | { verb: 'scale'; factor: number }
-  | { verb: DeviceName | 'dark' | 'light' | 'shot' | 'read' | 'look' | 'back' | 'reload' | 'console' | 'cookies' | 'storage' | 'a11y' | 'perf' | 'heap' | 'lighthouse' }
+  | { verb: 'read'; max?: number }
+  | { verb: DeviceName | 'dark' | 'light' | 'shot' | 'look' | 'back' | 'reload' | 'console' | 'cookies' | 'storage' | 'a11y' | 'perf' | 'heap' | 'lighthouse' }
 
 /** How many words each verb takes after it. */
 export const VERB_ARITY: Record<Step['verb'], number> = {
@@ -81,16 +82,20 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
   phone-small | phone | phone-large   360x780, 390x844, 430x932, with touch
   tablet | tablet-landscape           820x1180 or 1180x820, with touch
   desktop | laptop | wide | qhd       1280x800 (the default), 1440x900, 1920x1080 (1080p), 2560x1440
-  size WxH [touch]     any window size, e.g. size 1600x1000; "touch" after it turns touch on
+  size WxH [touch]     any window size, e.g. size 1600x1000, or a width alone (size 1440 is 1440x900); "touch"
+                       after it turns touch on
   motion reduce|normal prefers-reduced-motion for the page, from here on
   scale 1|2|3          device pixel ratio for sharp screenshots (a retina screen), until the next size step
   dark | light         colour scheme
-  read                 print the page's visible text (first 2,000 characters)
+  read [N]             print the page's visible text (first 2,000 characters, or N)
   shot                 save a screenshot and print its path
-  eval JS              run JS in the page and print the result: an expression, or statements as in the DevTools
-                       console (the last one's value, or a top-level return's); promises are awaited
-  ignore TEXT          from here on, console errors, page errors and responses whose text or URL holds TEXT
-                       (any case, * as a wildcard) print as info instead of warn or fail: expected noise
+  eval JS|@FILE        run JS in the page and print the result: an expression, or statements as in the DevTools
+                       console (the last one's value, or a top-level return's); promises are awaited. @FILE
+                       reads the script from a file, so quotes and newlines need no shell escaping
+  ignore TEXT|STATUS   from here on, console errors, page errors and responses whose text or URL holds TEXT
+                       (any case, * as a wildcard) print as info instead of warn or fail: expected noise. A bare
+                       status number (ignore 404) quiets everything that carries that status, including
+                       "Failed to load resource" console errors and page errors on a page that answered 404
   console              every console message and page error of this run, all levels
   network FILTER       this run's requests (method, status, time, type, URL): FILTER is part of the URL,
                        a type (fetch, xhr, document, script…) or a status (404, failed); "" for all
@@ -118,7 +123,11 @@ Claude Code session (or the calling process) in this project.
 --show uses a visible window instead (its own profile and sign-ins); --slow shows it and pauses between
 steps so a person can watch; --close closes this session's tab and stops Chrome unless other sessions use it.`
 
-/** Splits one line like a shell would for quoted words: "a b" and 'a b' are one word, \\" escapes. */
+/**
+ * Splits one line like a shell would for quoted words: "a b" and 'a b' are one word, \\" escapes.
+ * Inside a css=, role= or other selector word the quotes belong to the selector, not to the shell,
+ * so `click css=[aria-label="Show details"]` keeps both quotes and the space between them.
+ */
 export function tokenize(line: string): string[] {
   const out: string[] = []
   let cur = ''
@@ -130,6 +139,14 @@ export function tokenize(line: string): string[] {
       if (ch === '\\' && quote === '"' && i + 1 < line.length) { cur += line[++i]; continue }
       if (ch === quote) { quote = null; continue }
       cur += ch
+      continue
+    }
+    if ((ch === '"' || ch === "'") && isSelector(cur)) {
+      const end = line.indexOf(ch, i + 1)
+      if (end < 0) throw new Error(`unclosed ${ch} in: ${line}`)
+      cur += line.slice(i, end + 1)
+      i = end
+      started = true
       continue
     }
     if (ch === '"' || ch === "'") { quote = ch; started = true; continue }
@@ -165,6 +182,9 @@ export function parseSteps(words: readonly string[]): Step[] {
     let nth: number | undefined
     if ((verb === 'click' || verb === 'hover' || verb === 'fill' || verb === 'select') && /^[1-9]\d*$/.test(words[i] ?? '')) nth = Number(words[i++])
     const withNth = nth === undefined ? {} : { nth }
+    // read takes a character count the same way.
+    let max: number | undefined
+    if (verb === 'read' && /^[1-9]\d*$/.test(words[i] ?? '')) max = Number(words[i++])
     switch (verb) {
       case 'click': case 'hover': steps.push({ verb, target: args[0]!, ...withNth }); break
       case 'fill': case 'select': steps.push({ verb, target: args[0]!, value: args[1]!, ...withNth }); break
@@ -188,12 +208,16 @@ export function parseSteps(words: readonly string[]): Step[] {
         break
       }
       case 'network': case 'response': steps.push({ verb, filter: args[0]! }); break
+      case 'read': steps.push(max === undefined ? { verb } : { verb, max }); break
       case 'size': {
-        const m = /^(\d{3,4})x(\d{3,4})$/.exec(args[0]!)
-        if (!m || Number(m[1]) < 200 || Number(m[2]) < 200) throw new Error(`"size" needs WIDTHxHEIGHT, each 200 or more, e.g. 1920x1080 (got "${args[0]}")`)
+        // A width alone keeps the laptop's 16:10, so `size 1440` is 1440x900.
+        const m = /^(\d{3,4})(?:x(\d{3,4}))?$/.exec(args[0]!)
+        const width = m ? Number(m[1]) : 0
+        const height = m ? (m[2] ? Number(m[2]) : Math.round((width * 10) / 16)) : 0
+        if (!m || width < 200 || height < 200) throw new Error(`"size" needs WIDTHxHEIGHT, each 200 or more, e.g. 1920x1080 or 1440 (got "${args[0]}")`)
         const touch = words[i] === 'touch'
         if (touch) i++
-        steps.push({ verb, width: Number(m[1]), height: Number(m[2]), ...(touch ? { touch } : {}) })
+        steps.push({ verb, width, height, ...(touch ? { touch } : {}) })
         break
       }
       case 'scale': {
@@ -247,6 +271,7 @@ export function stepLabel(s: Step): string {
     case 'cookie': return `cookie ${q(s.name)} (value ${s.value.length} chars)`
     case 'clear-cookies': return s.domain ? `clear-cookies ${q(s.domain)}` : 'clear-cookies'
     case 'network': case 'response': return `${s.verb} ${q(s.filter)}`
+    case 'read': return s.max === undefined ? 'read' : `read ${s.max}`
     default: return s.verb
   }
 }
@@ -298,6 +323,31 @@ export function ignoredBy(patterns: readonly string[], ...texts: string[]): stri
     const re = new RegExp(p.split('*').map((x) => x.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*'), 'i')
     return texts.some((t) => re.test(t))
   })
+}
+
+/** `ignore 404`: a bare status number quiets whatever carries that status, whatever the words say. */
+export function ignoredStatus(patterns: readonly string[], status: number | undefined): string | undefined {
+  if (status === undefined) return undefined
+  return patterns.find((p) => /^\d{3}$/.test(p) && Number(p) === status)
+}
+
+/** The status Chrome puts in "Failed to load resource: the server responded with a status of 404 (Not Found)". */
+export function statusIn(text: string): number | undefined {
+  const m = /status of (\d{3})/.exec(text)
+  return m ? Number(m[1]) : undefined
+}
+
+/**
+ * The line under a click or fill that found nothing: what was looked at, so the next try can be narrower.
+ * It starts with the old words ("nothing matches", "no such field") so existing habits still read.
+ */
+export function noMatchNote(o: { fields?: boolean; selector?: boolean; considered: number }): string {
+  const noun = o.fields ? 'fields' : 'controls'
+  if (o.selector && o.considered === 0) return 'nothing matches; no element matches that selector'
+  // A selector that matched but shows nothing is the common trap: the element is there, hidden or 0x0.
+  if (o.selector) return `nothing matches; the selector matched ${o.considered} ${o.considered === 1 ? 'element' : 'elements'}, none of them visible`
+  const saw = o.considered ? `looked at ${o.considered} visible ${o.considered === 1 ? noun.slice(0, -1) : noun}` : `no visible ${noun} to look at`
+  return `${o.fields ? 'no such field' : 'nothing matches'}; ${saw}, css=… or role=… reaches anything the words miss`
 }
 
 /** Text that means the page is an error screen, though it rendered. */
@@ -399,6 +449,17 @@ export function lookProblems(answers: ReadonlyArray<{ id: string; p: number | nu
     .filter((a) => a.p !== null && a.p >= LOOK_WARN_AT)
     .sort((a, b) => b.p! - a.p!)
     .map((a) => `${a.id} (p ${a.p!.toFixed(2)})`)
+}
+
+/**
+ * A look that only warns: what it judged, and why a warn is not a failure. A screenshot that ends
+ * mid-band (content continues below the fold) is read as broken, so scrolling and looking again is the check.
+ */
+export function lookWarnNote(answers: ReadonlyArray<{ id: string; p: number | null }>): string {
+  const problems = lookProblems(answers).map((p) => (p.startsWith('broken')
+    ? p.replace(/\)$/, ', a screenshot cut by the viewport reads as broken; scroll and look again)')
+    : p))
+  return `WARN ${problems.join(', ')}`
 }
 
 /** Candidate controls for the classifier fallback, as items it is asked about one by one. */

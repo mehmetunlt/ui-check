@@ -5,7 +5,7 @@
 import { after, before, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createServer as netServer, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -77,6 +77,11 @@ const ROUTES: Record<string, Handler> = {
     <div style="position:fixed;inset:0;background:rgba(0,0,0,.4)"></div>
     <div role="dialog" aria-modal="true" style="position:fixed;top:0;right:0;bottom:0;width:360px;background:#fff">
       <form onsubmit="hit('panel'); return false"><textarea aria-label="Note"></textarea><button>Add adjustment</button></form></div>`),
+  // A quoted attribute selector's host, its hidden twin (in the DOM with no box), and a page whose
+  // fixture is missing, so every page logs the same 404 console error.
+  '/quoted': html(`${HIT}<button onclick="hit('details')" aria-label="Show details" style="width:90px;height:30px">i</button>`),
+  '/hidden': html('<button aria-label="Show details" style="display:none">i</button>'),
+  '/missing-fixture': html('<h1>Earnings</h1><img src="/nope.png" alt="">'),
 }
 
 let state = ''
@@ -266,6 +271,50 @@ test('a step that navigates prints where the page went', { skip }, async () => {
   assert.match(r.out, new RegExp(`^ok {3}click "Push" {2}name -> ${base}/c {2}`, 'm'), r.out)
   assert.match(r.out, new RegExp(`^ok {3}press Enter {2}-> ${base}/b\\?q=x {2}`, 'm'), r.out)
   assert.match(r.out, /^ok {3}fill "Query" "x" {2}name {2}\(/m, r.out)
+})
+
+test('a quoted css= selector clicks, size sets the viewport, read N cuts, eval @file reads a script', { skip }, async () => {
+  const file = join(state, 'script.js')
+  writeFileSync(file, ['const n = 40', 'const q = "it\'s"', 'return `${document.title} ${n + 2} ${q} "quoted"`', ''].join('\n'))
+  const r = await uiCheck(['open', '/quoted',
+    'click', 'css=[aria-label="Show details"]', 'eval', 'document.body.dataset.hit',
+    'eval', `@${file}`,
+    'size', '1920x1080', 'eval', 'innerWidth + "x" + innerHeight',
+    'size', '1440', 'eval', 'innerWidth + "x" + innerHeight',
+    'wide', 'eval', 'innerWidth + "x" + innerHeight',
+    'desktop', 'eval', 'innerWidth + "x" + innerHeight',
+    'laptop', 'eval', 'innerWidth + "x" + innerHeight',
+    'open', '/a', 'read', '4'])
+  assert.equal(r.code, 0, r.out)
+  assert.match(r.out, /^ok {3}click "css=\[aria-label=\\"Show details\\"\]" {2}selector/m, r.out)
+  assert.deepEqual(printed(r.out), ['details', 't 42 it\'s "quoted"', '1920x1080', '1440x900', '1920x1080', '1280x800', '1440x900', 'Page'], r.out)
+})
+
+test('eval @a missing file fails that step in plain words and the rest runs', { skip }, async () => {
+  const r = await uiCheck(['open', '/a', 'eval', '@no-such-script.js', 'eval', '1'])
+  assert.equal(r.code, 1, r.out)
+  assert.match(r.out, /^FAIL eval "@no-such-script\.js" {2}no such file: .*no-such-script\.js/m, r.out)
+  assert.deepEqual(printed(r.out), ['1'], r.out)
+})
+
+test('a click that found nothing says what it looked at', { skip }, async () => {
+  const text = await uiCheck(['open', '/quoted', 'click', 'No such button'])
+  assert.equal(text.code, 1, text.out)
+  assert.match(text.out, /nothing matches; looked at 1 visible control, css=… or role=… reaches anything the words miss/, text.out)
+  const sel = await uiCheck(['open', '/hidden', 'click', 'css=[aria-label="Show details"]'])
+  assert.equal(sel.code, 1, sel.out)
+  assert.match(sel.out, /nothing matches; the selector matched 1 element, none of them visible/, sel.out)
+  const none = await uiCheck(['open', '/quoted', 'click', 'css=.nowhere'])
+  assert.match(none.out, /nothing matches; no element matches that selector/, none.out)
+})
+
+test('ignore 404 quiets the missing fixture on every page', { skip }, async () => {
+  const loud = await uiCheck(['open', '/missing-fixture'])
+  assert.match(loud.out, /^warn console: Failed to load resource: the server responded with a status of 404/m, loud.out)
+  const quiet = await uiCheck(['ignore', '404', 'open', '/missing-fixture'])
+  assert.equal(quiet.code, 0, quiet.out)
+  assert.doesNotMatch(quiet.out, /^warn/m, quiet.out)
+  assert.match(quiet.out, /^info ignored: console: Failed to load resource/m, quiet.out)
 })
 
 test('settleForLook waits for the page to stop changing, at most its bound', { skip }, async () => {

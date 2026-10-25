@@ -29,7 +29,7 @@ import type { Decisions } from './classifier/types.ts'
 import { fitForLook } from './look-image.ts'
 import { settleForLook, trackRequests } from './settle.ts'
 import {
-  LOOK_QUESTIONS, NEXT_DEV_SELECTORS, SEE_ID, USAGE, bestCandidate, devOverlayStyle, ignoredBy, judgeWithRetry, pageErrorsFail, tidyText, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
+  LOOK_QUESTIONS, NEXT_DEV_SELECTORS, SEE_ID, USAGE, bestCandidate, devOverlayStyle, ignoredBy, ignoredStatus, judgeWithRetry, lookWarnNote, noMatchNote, pageErrorsFail, statusIn, tidyText, dialogPolicy, lighthouseSummary, candidateText, isSelector, lookFails, lookProblems, parseSteps, pickQuestion, planWords,
   rankMatches, resolveUrl, seeQuestion, seeVerdict, splitOrdinal, stepLabel, type Candidate, type MatchInfo, type Step,
   DEVICES, isDevice,
 } from './steps.ts'
@@ -252,10 +252,13 @@ let calls = 0
 let failures = 0
 let warnings = 0
 let shotN = 0
-// Console and network notes since the last step, with the URL they are about (for ignore).
-const pending: Array<{ text: string; url?: string }> = []
+// Console and network notes since the last step, with the URL they are about (for ignore) and the
+// HTTP status when one is known (an `ignore 404` matches on it, whatever the words say).
+const pending: Array<{ text: string; url?: string; status?: number }> = []
 const pageErrors: string[] = []
 const ignores: string[] = []
+// ignore TEXT matches text or URL; a bare number (ignore 404) matches the HTTP status as well.
+const isIgnored = (text: string, url = '', status?: number) => ignoredBy(ignores, text, url) ?? ignoredStatus(ignores, status)
 // The status of the document this step loaded, if it loaded one.
 let stepDoc: number | null = null
 // Everything this run saw, for the console and network steps.
@@ -558,10 +561,18 @@ function tiers(page: Page, target: string, fields: boolean): Array<[Locator, str
       ]
 }
 
+/** What a click or fill found, and when it found nothing, how much there was to look at. */
+type Search = { hit: Hit | null; considered: number; selector: boolean }
+
 /** The element words name: selector, role and name, label, text, "second TEXT"; then the classifier's pick. */
-async function find(page: Page, verb: 'click' | 'hover' | 'fill' | 'select', target: string, nth?: number): Promise<Hit | null> {
+async function find(page: Page, verb: 'click' | 'hover' | 'fill' | 'select', target: string, nth?: number): Promise<Search> {
   const fields = verb === 'fill' || verb === 'select'
-  if (isSelector(target)) return choose(page.locator(target), 'selector', fields, nth)
+  const none = (considered: number): Search => ({ hit: null, considered, selector: false })
+  if (isSelector(target)) {
+    const loc = page.locator(target)
+    const hit = await choose(loc, 'selector', fields, nth)
+    return { hit, considered: hit ? 0 : await loc.count().catch(() => 0), selector: true }
+  }
   // A custom dropdown's trigger may be a button named for the field.
   const all = async (words: string) => {
     if (fields) await page.evaluate(LABEL_JS, { target: words, select: verb === 'select' }).catch(() => 0)
@@ -569,23 +580,23 @@ async function find(page: Page, verb: 'click' | 'hover' | 'fill' | 'select', tar
   }
   for (const [loc, how] of await all(target)) {
     const hit = await choose(loc, how, fields, nth)
-    if (hit) return hit
+    if (hit) return { hit, considered: 0, selector: false }
   }
   const ord = nth === undefined ? splitOrdinal(target) : null
   if (ord) {
     for (const [loc, how] of await all(ord.rest)) {
       const hit = await choose(loc, how, fields, ord.nth)
-      if (hit) return hit
+      if (hit) return { hit, considered: 0, selector: false }
     }
   }
   const cands = await candidates(page, fields)
-  if (cands.length === 0) return null
+  if (cands.length === 0) return none(0)
   const answers = await ask({ questions: [pickQuestion(verb, target)], items: cands.map((c) => ({ id: String(c.idx), text: candidateText(c) })) })
   const best = answers ? bestCandidate(answers) : null
-  if (!best) return null
+  if (!best) return none(cands.length)
   const loc = page.locator(`[data-ui-check="${best.idx}"]`).first()
   const c = cands.find((x) => x.idx === best.idx)
-  return { loc, how: `picked "${(c?.name || c?.tag || '').slice(0, 50)}" p ${best.p.toFixed(2)}` }
+  return { hit: { loc, how: `picked "${(c?.name || c?.tag || '').slice(0, 50)}" p ${best.p.toFixed(2)}` }, considered: 0, selector: false }
 }
 
 // Playwright calls a function, not a string holding one (that is evaluated as an expression).
@@ -624,7 +635,7 @@ async function customSelect(page: Page, hit: Hit, option: string): Promise<Outco
     ]
     let pick: Hit | null = null
     for (const [loc, how] of optionTiers) if ((pick = await choose(loc, how, false))) break
-    pick ??= await find(page, 'click', option)
+    pick ??= (await find(page, 'click', option)).hit
     if (!pick) return { ok: false, note: `${hit.how}; opened${typed ? `, typed "${option}"` : ''}, but no option "${option}" shows` }
     await pick.loc.click({ timeout: 8_000 })
     await settle(page)
@@ -707,28 +718,28 @@ async function run(page: Page, s: Step): Promise<Outcome> {
       return { ok: status < 400, note: `${status || 'no response'} ${page.url()}` }
     }
     case 'click': case 'hover': {
-      const hit = await find(page, s.verb, s.target, s.nth)
-      if (!hit) return { ok: false, note: 'nothing matches' }
+      const { hit, considered, selector } = await find(page, s.verb, s.target, s.nth)
+      if (!hit) return { ok: false, note: noMatchNote({ considered, selector }) }
       if (s.verb === 'click') await hit.loc.click({ timeout: 8_000 })
       else await hit.loc.hover({ timeout: 8_000 })
       await settle(page)
       return { ok: true, note: hit.how }
     }
     case 'fill': case 'select': {
-      const hit = await find(page, s.verb, s.target, s.nth)
-      if (!hit) return { ok: false, note: 'no such field' }
+      const { hit, considered, selector } = await find(page, s.verb, s.target, s.nth)
+      if (!hit) return { ok: false, note: noMatchNote({ fields: true, considered, selector }) }
       if (s.verb === 'fill') await hit.loc.fill(s.value, { timeout: 8_000 })
       else if (await hit.loc.evaluate(IS_SELECT_JS)) await hit.loc.selectOption({ label: s.value }, { timeout: 8_000 })
       else return customSelect(page, hit, s.value)
       return { ok: true, note: hit.how }
     }
     case 'drag': {
-      const from = await find(page, 'click', s.target)
+      const from = (await find(page, 'click', s.target)).hit
       if (!from) return { ok: false, note: 'nothing matches the start' }
       await from.loc.scrollIntoViewIfNeeded()
       const a = await from.loc.boundingBox()
       // Found after the start's box is read: a classifier pick re-marks the page.
-      const to = await find(page, 'click', s.value)
+      const to = (await find(page, 'click', s.value)).hit
       if (!to) return { ok: false, note: 'nothing matches the target' }
       const b = await to.loc.boundingBox()
       if (!a || !b) return { ok: false, note: 'an element has no box on screen' }
@@ -744,7 +755,7 @@ async function run(page: Page, s: Step): Promise<Outcome> {
     case 'upload': {
       const file = resolve(s.value)
       if (!existsSync(file)) return { ok: false, note: `no such file: ${file}` }
-      const hit = await find(page, 'click', s.target)
+      const hit = (await find(page, 'click', s.target)).hit
       if (hit) {
         if (await hit.loc.evaluate(IS_FILE_JS)) {
           await hit.loc.setInputFiles(file)
@@ -824,7 +835,8 @@ async function run(page: Page, s: Step): Promise<Outcome> {
       const problems = lookProblems(answers)
       if (lookFails(answers)) return { ok: false, note: problems.join(', ') }
       if (problems.length) warnings++
-      return { ok: true, note: problems.length ? `WARN ${problems.join(', ')}` : 'clean' }
+      // A warn is not a failure: say what was judged and that a cut-off screenshot is the usual cause.
+      return { ok: true, note: problems.length ? lookWarnNote(answers) : 'clean' }
     }
     case 'scroll': {
       if (s.target === 'down' || s.target === 'up') await page.mouse.wheel(0, (s.target === 'down' ? 1 : -1) * (page.viewportSize()?.height ?? 800) * 0.8)
@@ -853,9 +865,13 @@ async function run(page: Page, s: Step): Promise<Outcome> {
     case 'motion': await page.emulateMedia({ reducedMotion: s.reduce ? 'reduce' : 'no-preference' }); await sleep(300); return { ok: true }
     case 'dark': case 'light': await page.emulateMedia({ colorScheme: s.verb }); await rememberScheme(s.verb); await sleep(300); return { ok: true }
     case 'shot': return { ok: true, note: await saveShot(page, 'shot') }
-    case 'read': return { ok: true, print: (await visibleText(page)).slice(0, 2_000) }
+    case 'read': return { ok: true, print: (await visibleText(page)).slice(0, s.max ?? 2_000) }
     case 'eval': {
-      const v = await evaluate(page, s.script)
+      // `eval @FILE`: the script comes from a file, so its quotes and newlines never meet a shell.
+      const fromFile = s.script.startsWith('@')
+      const file = fromFile ? resolve(s.script.slice(1)) : ''
+      if (fromFile && !existsSync(file)) return { ok: false, note: `no such file: ${file}` }
+      const v = await evaluate(page, fromFile ? readFileSync(file, 'utf8') : s.script)
       return { ok: true, print: typeof v === 'string' ? v : JSON.stringify(v) }
     }
     case 'console':
@@ -940,7 +956,7 @@ async function main(): Promise<void> {
   })
   page.on('console', (m) => {
     consoleLog.push(`[${m.type()}] ${m.text().slice(0, 500)}`)
-    if (m.type() === 'error') pending.push({ text: `console: ${m.text().split('\n')[0]!.slice(0, 200)}`, url: m.location().url })
+    if (m.type() === 'error') pending.push({ text: `console: ${m.text().split('\n')[0]!.slice(0, 200)}`, url: m.location().url, status: statusIn(m.text()) })
   })
   const logRequest = (e: NetEntry) => { netLog.push(e); if (netLog.length > NET_KEEP) netLog.shift() }
   page.on('requestfinished', (r) => {
@@ -952,7 +968,7 @@ async function main(): Promise<void> {
   // Server errors on any request, refusals on writes (a GET 401 on the sign-in page is expected).
   page.on('response', (r) => {
     if (r.request().isNavigationRequest() && r.frame() === page.mainFrame()) stepDoc = r.status()
-    if ((r.status() >= 500 || (r.status() >= 400 && r.request().method() !== 'GET')) && r.url().startsWith(origin())) pending.push({ text: `${r.status()} ${r.request().method()} ${r.url().replace(origin(), '')}`, url: r.url() })
+    if ((r.status() >= 500 || (r.status() >= 400 && r.request().method() !== 'GET')) && r.url().startsWith(origin())) pending.push({ text: `${r.status()} ${r.request().method()} ${r.url().replace(origin(), '')}`, url: r.url(), status: r.status() })
   })
   page.on('requestfailed', (r) => {
     const why = r.failure()?.errorText ?? ''
@@ -968,7 +984,7 @@ async function main(): Promise<void> {
     let out: Outcome
     try { out = await run(page, s) } catch (e) { out = { ok: false, note: (e as Error).message.split('\n')[0]!.slice(0, 200) } }
     const errors: string[] = []
-    for (const e of pageErrors.splice(0)) if (ignoredBy(ignores, e)) infos.push(`ignored: page error: ${e}`); else errors.push(e)
+    for (const e of pageErrors.splice(0)) if (isIgnored(e, '', stepDoc ?? undefined)) infos.push(`ignored: page error: ${e}`); else errors.push(e)
     if (errors.length) {
       // On a page that loaded and rendered, an error elsewhere (a failed server action, say) is a warning.
       const shown = stepDoc === null ? null : await page.evaluate<{ textChars: number; media: number; text: string }>(RENDERED_JS).catch(() => null)
@@ -981,7 +997,7 @@ async function main(): Promise<void> {
     const ms = Date.now() - began
     console.log(`${out.ok ? 'ok  ' : 'FAIL'} ${stepLabel(s)}${out.note ? `  ${out.note}` : ''}  (${ms} ms)`)
     if (out.print !== undefined) console.log(out.print.split('\n').map((l) => `     ${l}`).join('\n'))
-    for (const n of pending.splice(0)) if (ignoredBy(ignores, n.text, n.url ?? '')) infos.push(`ignored: ${n.text}`); else pending.push(n)
+    for (const n of pending.splice(0)) if (isIgnored(n.text, n.url ?? '', n.status)) infos.push(`ignored: ${n.text}`); else pending.push(n)
     for (const n of [...new Set(infos.splice(0))]) console.log(`info ${n}`)
     if (pending.length) {
       const notes = [...new Set(pending.map((n) => n.text))]
