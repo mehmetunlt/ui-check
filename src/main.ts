@@ -17,7 +17,7 @@
  * wrote, never by pattern. Screenshots go to
  * $TMPDIR/agents-ui-check and their paths are printed (on `shot` and on every failure).
  */
-import { execFile, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -33,7 +33,7 @@ import {
   rankMatches, resolveUrl, seeQuestion, seeVerdict, splitOrdinal, stepLabel, type Candidate, type MatchInfo, type Step,
   DEVICES, isDevice,
 } from './steps.ts'
-import { acquireLock, activeSessions, callerId, listProcs, lockHolder, projectRoot, readRegistry, sessionKey, staleSessions, writeRegistry } from './session.ts'
+import { acquireLock, activeSessions, alive, callerId, listProcs, lockHolder, projectRoot, readRegistry, sessionKey, staleSessions, writeRegistry } from './session.ts'
 
 
 // UI_CHECK_STATE and UI_CHECK_PORT give the tests a Chrome of their own.
@@ -55,8 +55,11 @@ const FIELD_ROLES = ['textbox', 'searchbox', 'combobox', 'spinbutton'] as const
 const argv = process.argv.slice(2).filter((a) => a !== '--')
 let base = process.env.UI_CHECK_BASE ?? 'http://localhost:5173'
 let close = false
+let force = false
 let pauseMs = 0
 let show = process.env.UI_CHECK_SHOW === '1'
+/** Per step, so a frozen page or a CDP call that never answers fails the step instead of wedging the run. */
+let stepTimeoutMs = 120_000
 const words: string[] = []
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i]!
@@ -64,6 +67,9 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--base') base = argv[++i] ?? base
   else if (a === '--plan') words.push(...planWords(readFileSync(argv[++i] ?? '', 'utf8')))
   else if (a === '--close') close = true
+  else if (a === '--force') force = true
+  else if (a === '--reset') { close = true; force = true }
+  else if (a === '--step-timeout') { const sec = Number(argv[++i] ?? 120); stepTimeoutMs = (Number.isFinite(sec) ? Math.max(5, sec) : 120) * 1_000 }
   else if (a === '--slow') { pauseMs = 1_200; show = true }
   else if (a === '--show') show = true
   else words.push(a)
@@ -73,12 +79,26 @@ for (let i = 0; i < argv.length; i++) {
 const SESSION = sessionKey(callerId(process.env, process.env.UI_CHECK_SESSION || process.env.CLAUDE_CODE_SESSION_ID ? [] : listProcs(), process.pid), projectRoot(process.cwd()))
 const tabLock = (m: Mode, key: string) => join(STATE_DIR, 'locks', `${m.headless ? 'hidden' : 'shown'}-${key}.lock`)
 const tabLocked = (m: Mode) => (key: string) => lockHolder(tabLock(m, key)) !== null
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/** Stop the run holding a tab lock (the caller's own session, when --close is used while it runs). */
+function killHolder(file: string): void {
+  const pid = lockHolder(file)
+  if (!pid || pid === process.pid) return
+  try { process.kill(pid, 'SIGTERM') } catch {}
+  for (let i = 0; i < 10 && alive(pid); i++) execFileSync('sleep', ['0.1'])
+  if (alive(pid)) { try { process.kill(pid, 'SIGKILL') } catch {} }
+}
 
 if (close && words.length === 0) {
   for (const m of [MODES.shown, MODES.hidden]) {
-    const tab = (await portUp(m)) && activeSessions(readRegistry(m.sessions), SESSION, Date.now(), tabLocked(m)).length ? await closeOwnTab(m) : false
-    await stopUnlessShared(m, tab)
+    try {
+      const tab = !force && (await portUp(m)) && activeSessions(readRegistry(m.sessions), SESSION, Date.now(), tabLocked(m)).length ? await closeOwnTab(m) : false
+      killHolder(tabLock(m, SESSION))
+      await stopUnlessShared(m, tab)
+    } catch (e) { console.error(`ui-check: close of the ${m.headless ? 'hidden' : 'visible'} Chrome failed: ${(e as Error).message}`) }
   }
+  if (force) resetLocks()
   process.exit(0)
 }
 const mode = show ? MODES.shown : MODES.hidden
@@ -92,6 +112,31 @@ async function portUp(m: Mode): Promise<boolean> {
 }
 const endpointUp = () => portUp(mode)
 
+/** A promise that rejects after `ms`; the underlying call may still be running, but the run is not wedged on it. */
+function withTimeout<T>(p: Promise<T> | T, ms: number, what: string): Promise<T> {
+  return new Promise<T>((done, fail) => {
+    const t = setTimeout(() => fail(new Error(`${what} timed out after ${ms} ms`)), ms)
+    Promise.resolve(p).then((v) => { clearTimeout(t); done(v) }, (e) => { clearTimeout(t); fail(e) })
+  })
+}
+
+/** The page targets Chrome lists, or null when its debug port does not answer in time (it is hung). */
+async function liveTargets(m: Mode): Promise<Set<string> | null> {
+  try {
+    const list = (await (await fetch(`http://127.0.0.1:${m.port}/json/list`, { signal: AbortSignal.timeout(3_000) })).json()) as Array<{ id: string; type: string }>
+    return new Set(list.filter((t) => t.type === 'page').map((t) => t.id))
+  } catch { return null }
+}
+
+/** Kill Chrome by its profile path: the pid file can be gone or name a launcher, and the port still answers. */
+function killProfile(m: Mode): void {
+  for (const sig of ['-15', '-9'] as const) {
+    // `--` before the pattern: a profile path starts with --user-data-dir, which pkill would read as options.
+    try { execFileSync('pkill', [sig, '-f', '--', `--user-data-dir=${m.profile}`], { stdio: 'ignore', timeout: 2_000 }) } catch {}
+    if (sig === '-15') execFileSync('sleep', ['0.3'])
+  }
+}
+
 /**
  * Headless Chrome on a machine with no mouse reports no pointer and no hover, so `(hover: hover)` and
  * `(pointer: fine)` rules never applied in a desktop check. This tells Blink there is a mouse (fine pointer, hover);
@@ -101,6 +146,9 @@ const MOUSE = '--blink-settings=primaryPointerType=4,availablePointerTypes=4,pri
 
 async function ensureChrome(): Promise<void> {
   if (await endpointUp()) return
+  // The port does not answer but a Chrome left by a hung run may still hold the profile: a second one would exit on the
+  // profile lock, and every run would fail until someone killed it by hand.
+  if (existsSync(mode.pidFile)) killProfile(mode)
   if (!CHROME) throw new Error('no Chrome found (set CHROME_PATH)')
   mkdirSync(mode.profile, { recursive: true })
   const child = spawn(CHROME, [
@@ -117,45 +165,87 @@ async function ensureChrome(): Promise<void> {
 }
 
 /**
- * Stops the mode's Chrome through its debug port (Browser.close), so it works when the pid file is gone or names the
- * launcher's pid; the pid is the fallback for a Chrome whose port no longer answers.
+ * Stops the mode's Chrome. Browser.close over the debug port is the clean way; every wait is bounded, so a hung
+ * Chrome cannot hold `--close` forever, and the profile's own process is the fallback when the port is gone or dead.
  */
 async function stopChrome(m: Mode): Promise<void> {
   const which = m.headless ? 'hidden' : 'visible'
   let stopped = false
   if (await portUp(m)) {
     try {
-      const b = await chromium.connectOverCDP(`http://127.0.0.1:${m.port}`, { timeout: 5_000 })
-      await (await b.newBrowserCDPSession()).send('Browser.close').catch(() => {})
+      const b = await withTimeout(chromium.connectOverCDP(`http://127.0.0.1:${m.port}`, { timeout: 3_000 }), 3_500, 'Chrome connect')
+      const s = await withTimeout(b.newBrowserCDPSession(), 2_000, 'Chrome session')
+      await withTimeout(s.send('Browser.close'), 2_500, 'Chrome close').catch(() => {})
       stopped = true
     } catch {}
   }
+  // Give a clean close a moment, then make sure: a renderer that is gone or a dialog can keep the port up.
+  for (let i = 0; i < 20 && await portUp(m); i++) await sleep(100)
+  if (await portUp(m) || existsSync(m.pidFile)) { killProfile(m); stopped = true }
   if (!stopped && existsSync(m.pidFile)) {
     const pid = Number(readFileSync(m.pidFile, 'utf8'))
-    try { process.kill(pid, 'SIGTERM'); stopped = true } catch {}
+    try { process.kill(pid, 'SIGTERM') } catch {}
+    stopped = true
   }
-  console.log(stopped ? `stopped the ${which} ui-check Chrome` : `no ${which} ui-check Chrome is running`)
+  console.log(stopped || !(await portUp(m)) ? `stopped the ${which} ui-check Chrome` : `could not stop the ${which} ui-check Chrome`)
   rmSync(m.pidFile, { force: true })
   rmSync(m.sessions, { force: true })
 }
 
-/** --close: Chrome stops unless other sessions are using it (a run going, or one in the last minutes). */
+/** Everything a stuck run leaves behind: locks, registries, pid files (the profiles and sign-ins stay). */
+function resetLocks(): void {
+  // The tab lock names the run that holds it: a run stuck on a page is stopped with the Chrome, or it keeps the
+  // session for minutes after the force quit.
+  try {
+    for (const f of readdirSync(join(STATE_DIR, 'locks'))) {
+      const pid = lockHolder(join(STATE_DIR, 'locks', f))
+      if (pid && pid !== process.pid) { try { process.kill(pid, 'SIGTERM') } catch {} }
+    }
+  } catch {}
+  try { for (const f of readdirSync(join(STATE_DIR, 'locks'))) rmSync(join(STATE_DIR, 'locks', f), { force: true }) } catch {}
+  for (const m of [MODES.shown, MODES.hidden]) {
+    rmSync(m.pidFile, { force: true })
+    rmSync(m.sessions, { force: true })
+    rmSync(`${m.sessions}.lock`, { force: true })
+  }
+}
+
+/**
+ * --close: Chrome stops unless another session really has a tab in it. The registry alone cannot say: a session killed
+ * mid-run keeps a recent `used` and a target that no longer exists, and used to make `--close` leave a Chrome nobody
+ * could stop. `--force` (or `--reset`) stops it whatever the registry says.
+ */
 async function stopUnlessShared(m: Mode, closedTab: boolean): Promise<void> {
-  const others = activeSessions(readRegistry(m.sessions), SESSION, Date.now(), tabLocked(m))
+  if (force) return stopChrome(m)
+  const targets = await liveTargets(m)
+  if (targets === null) return stopChrome(m)
+  // Drop registry entries whose tab is gone: a dead session is not a reason to keep Chrome.
+  const release = await acquireLock(`${m.sessions}.lock`, 4_000).catch(() => null)
+  try {
+    if (release) {
+      const reg = readRegistry(m.sessions)
+      let changed = false
+      for (const [k, v] of Object.entries(reg)) if (!targets.has(v.target)) { delete reg[k]; changed = true }
+      if (changed) writeRegistry(m.sessions, reg)
+    }
+  } finally { release?.() }
+  const others = activeSessions(readRegistry(m.sessions), SESSION, Date.now(), tabLocked(m)).filter((k) => {
+    const t = readRegistry(m.sessions)[k]?.target
+    return Boolean(t && targets.has(t))
+  })
   if (others.length && await portUp(m)) {
-    console.log(`${closedTab ? "closed this session's tab; " : ''}left the ${m.headless ? 'hidden' : 'visible'} ui-check Chrome running: ${others.length} other ${others.length === 1 ? 'session uses' : 'sessions use'} it`)
+    console.log(`${closedTab ? "closed this session's tab; " : ''}left the ${m.headless ? 'hidden' : 'visible'} ui-check Chrome running: ${others.length} other ${others.length === 1 ? 'session uses' : 'sessions use'} it (use --close --force to stop it)`)
   } else await stopChrome(m)
 }
 
-/** --close on its own, while other sessions keep Chrome: just this session's tab goes. */
+/** --close on its own, while other sessions keep Chrome: just this session's tab goes, over Chrome's HTTP door. */
 async function closeOwnTab(m: Mode): Promise<boolean> {
   const entry = readRegistry(m.sessions)[SESSION]
   if (!entry) return false
-  try {
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${m.port}`, { timeout: 5_000 })
-    for (const p of browser.contexts()[0]?.pages() ?? []) if ((await targetId(p).catch(() => '')) === entry.target) await p.close().catch(() => {})
-  } catch {}
-  await forgetSession(m)
+  try { await fetch(`http://127.0.0.1:${m.port}/json/close/${encodeURIComponent(entry.target)}`, { signal: AbortSignal.timeout(3_000) }) } catch {}
+  await acquireLock(`${m.sessions}.lock`, 4_000).then(async (release) => {
+    try { const reg = readRegistry(m.sessions); delete reg[SESSION]; writeRegistry(m.sessions, reg) } finally { release() }
+  }).catch(() => {})
   return true
 }
 
@@ -166,7 +256,7 @@ async function closeOwnTab(m: Mode): Promise<boolean> {
  */
 async function pruneOrphanTabs(): Promise<void> {
   const base = `http://127.0.0.1:${mode.port}`
-  const release = await acquireLock(`${mode.sessions}.lock`, 15_000)
+  const release = await acquireLock(`${mode.sessions}.lock`, 5_000)
   try {
     const reg = readRegistry(mode.sessions)
     const owned = new Set(Object.values(reg).map((e) => e.target))
@@ -193,14 +283,15 @@ async function pruneOrphanTabs(): Promise<void> {
 }
 
 async function targetId(p: Page): Promise<string> {
-  const s = await p.context().newCDPSession(p)
-  try { return (await s.send('Target.getTargetInfo')).targetInfo.targetId } finally { await s.detach().catch(() => {}) }
+  const s = await withTimeout(p.context().newCDPSession(p), 3_000, 'tab session')
+  try { return (await withTimeout(s.send('Target.getTargetInfo'), 3_000, 'tab target')).targetInfo.targetId } finally { await s.detach().catch(() => {}) }
 }
+
 
 /** This session's tab, opened on its first run; other sessions' tabs idle for hours are closed. */
 async function sessionPage(browser: Browser): Promise<Page> {
   const ctx = browser.contexts()[0] ?? (await browser.newContext())
-  const release = await acquireLock(`${mode.sessions}.lock`, 15_000)
+  const release = await acquireLock(`${mode.sessions}.lock`, 5_000)
   try {
     const reg = readRegistry(mode.sessions)
     const pages = ctx.pages()
@@ -227,7 +318,7 @@ async function sessionPage(browser: Browser): Promise<Page> {
 
 /** A `dark` or `light` step: kept for this session's tab, so another session connecting later puts it back. */
 async function rememberScheme(scheme: 'dark' | 'light'): Promise<void> {
-  const release = await acquireLock(`${mode.sessions}.lock`, 15_000)
+  const release = await acquireLock(`${mode.sessions}.lock`, 5_000)
   try {
     const reg = readRegistry(mode.sessions)
     if (reg[SESSION]) { reg[SESSION]!.scheme = scheme; writeRegistry(mode.sessions, reg) }
@@ -235,7 +326,7 @@ async function rememberScheme(scheme: 'dark' | 'light'): Promise<void> {
 }
 
 async function forgetSession(m: Mode): Promise<void> {
-  const release = await acquireLock(`${m.sessions}.lock`, 15_000)
+  const release = await acquireLock(`${m.sessions}.lock`, 4_000)
   try {
     const reg = readRegistry(m.sessions)
     delete reg[SESSION]
@@ -244,7 +335,6 @@ async function forgetSession(m: Mode): Promise<void> {
 }
 
 // ── run state ────────────────────────────────────────────────────────────────
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const t0 = Date.now()
 let decisions: Decisions | null = null
 let costMicroUsd = 0
@@ -922,6 +1012,19 @@ async function run(page: Page, s: Step): Promise<Outcome> {
   }
 }
 
+/** Connect, and once more after restarting a Chrome that no longer answers (a hung renderer can close the port's door). */
+async function connectChrome(): Promise<Browser> {
+  const url = `http://127.0.0.1:${mode.port}`
+  try { return await withTimeout(chromium.connectOverCDP(url, { timeout: 8_000 }), 9_000, 'Chrome connect') }
+  catch (e) {
+    console.log(`info Chrome did not answer (${(e as Error).message.split('\n')[0]}); restarting it`)
+    await stopChrome(mode)
+    await ensureChrome()
+    await pruneOrphanTabs()
+    return await withTimeout(chromium.connectOverCDP(url, { timeout: 8_000 }), 9_000, 'Chrome connect')
+  }
+}
+
 async function main(): Promise<void> {
   // One run at a time on a tab: a second run of this session waits for the first.
   const releaseTab = await acquireLock(tabLock(mode, SESSION), 300_000, (pid) => console.log(`info waiting for another run on this session's tab (pid ${pid})`))
@@ -929,15 +1032,15 @@ async function main(): Promise<void> {
   for (const [sig, n] of [['SIGINT', 2], ['SIGTERM', 15], ['SIGHUP', 1]] as const) process.on(sig, () => process.exit(128 + n))
   await ensureChrome()
   await pruneOrphanTabs()
-  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${mode.port}`)
+  const browser = await connectChrome()
   const page = await sessionPage(browser)
   trackRequests(page)
   browserRef = browser
   sweepOld()
-  await metrics(page).catch(() => {})
-  if (show) await page.bringToFront().catch(() => {})
-  await page.setViewportSize(DESKTOP)
-  if (mode.headless && !(await page.evaluate('matchMedia("(hover: hover)").matches').catch(() => true))) {
+  await withTimeout(metrics(page), 3_000, 'page metrics').catch(() => {})
+  if (show) await withTimeout(page.bringToFront(), 2_000, 'bring to front').catch(() => {})
+  await withTimeout(page.setViewportSize(DESKTOP), 3_000, 'viewport').catch(() => {})
+  if (mode.headless && !(await withTimeout(page.evaluate('matchMedia("(hover: hover)").matches'), 2_000, 'pointer check').catch(() => true))) {
     infos.push('this hidden Chrome was started without a mouse, so hover styles are off: run "ui-check --close" when no other session is checking, and the next run starts it with one')
   }
   const origin = () => { try { return new URL(base).origin } catch { return '' } }
@@ -982,18 +1085,21 @@ async function main(): Promise<void> {
     stepDoc = null
     const urlBefore = page.url()
     let out: Outcome
-    try { out = await run(page, s) } catch (e) { out = { ok: false, note: (e as Error).message.split('\n')[0]!.slice(0, 200) } }
+    // A frozen renderer or a CDP call that never answers would otherwise hang this run (and its tab lock) until the
+    // process is force quit. Lighthouse has its own four-minute budget.
+    const limit = s.verb === 'lighthouse' ? Math.max(stepTimeoutMs, 300_000) : stepTimeoutMs
+    try { out = await withTimeout(run(page, s), limit, stepLabel(s)) } catch (e) { out = { ok: false, note: (e as Error).message.split('\n')[0]!.slice(0, 200) } }
     const errors: string[] = []
     for (const e of pageErrors.splice(0)) if (isIgnored(e, '', stepDoc ?? undefined)) infos.push(`ignored: page error: ${e}`); else errors.push(e)
     if (errors.length) {
       // On a page that loaded and rendered, an error elsewhere (a failed server action, say) is a warning.
-      const shown = stepDoc === null ? null : await page.evaluate<{ textChars: number; media: number; text: string }>(RENDERED_JS).catch(() => null)
+      const shown = stepDoc === null ? null : await withTimeout(page.evaluate<{ textChars: number; media: number; text: string }>(RENDERED_JS), 3_000, 'page state').catch(() => null)
       if (shown && !pageErrorsFail({ docStatus: stepDoc, ...shown })) pending.push(...errors.map((e) => ({ text: `page error: ${e}` })))
       else out = { ok: false, note: [out.note, `page error: ${errors.join('; ')}`].filter(Boolean).join('; ') }
     }
     // Where a click, key or select took the page, as open says.
     if (s.verb !== 'open' && page.url() !== urlBefore) out.note = `${out.note ? `${out.note} ` : ''}-> ${page.url()}`
-    if (!out.ok) { failures++; out.note = `${out.note ?? ''} [${await saveShot(page, 'fail').catch(() => 'no screenshot')}]`.trim() }
+    if (!out.ok) { failures++; out.note = `${out.note ?? ''} [${await withTimeout(saveShot(page, 'fail'), 8_000, 'screenshot').catch(() => 'no screenshot')}]`.trim() }
     const ms = Date.now() - began
     console.log(`${out.ok ? 'ok  ' : 'FAIL'} ${stepLabel(s)}${out.note ? `  ${out.note}` : ''}  (${ms} ms)`)
     if (out.print !== undefined) console.log(out.print.split('\n').map((l) => `     ${l}`).join('\n'))
@@ -1005,6 +1111,11 @@ async function main(): Promise<void> {
       for (const n of notes.slice(0, 6)) console.log(`warn ${n}`)
       pending.length = 0
     }
+    // The call behind a timed-out step may still be running; later steps on the same page would race it.
+    if (out.note?.includes('timed out after')) {
+      console.log('info the run stopped at this step: the page or the browser stopped answering')
+      break
+    }
   }
   if (tracing && browserRef) {
     await browserRef.stopTracing().catch(() => {})
@@ -1013,8 +1124,8 @@ async function main(): Promise<void> {
   const secs = ((Date.now() - t0) / 1000).toFixed(1)
   console.log(`\n${steps.length} steps, ${failures} failed, ${warnings} warnings, ${calls} classifier calls ($${(costMicroUsd / 1e6).toFixed(4)}), ${secs} s`)
   if (close) {
-    await page.close().catch(() => {})
-    await forgetSession(mode)
+    await withTimeout(page.close(), 3_000, 'tab close').catch(() => {})
+    await forgetSession(mode).catch(() => {})
     await stopUnlessShared(mode, true)
   }
 }

@@ -54,7 +54,7 @@ export const VERB_ARITY: Record<Step['verb'], number> = {
   size: 1, motion: 1, scale: 1, ...(Object.fromEntries(Object.keys(DEVICES).map((d) => [d, 0])) as Record<DeviceName, 0>), dark: 0, light: 0, shot: 0, read: 0, look: 0, back: 0, reload: 0, console: 0, cookies: 0, storage: 0, a11y: 0,
 }
 
-export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--close] <steps…>
+export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--close [--force]] [--step-timeout SECONDS] <steps…>
   open PATH|URL        go to a page (PATH is joined to --base, default http://localhost:5173)
   click TEXT [N]       a button, link, tab or menu item by its name or text; css=… or role=… work too;
                        when nothing matches, the classifier picks the control TEXT describes. When several
@@ -89,6 +89,11 @@ export const USAGE = `ui-check [--base URL] [--plan FILE] [--show] [--slow] [--c
   dark | light         colour scheme
   read [N]             print the page's visible text (first 2,000 characters, or N)
   shot                 save a screenshot and print its path
+  --close              close this session's tab; stop Chrome when no other session has a tab in it
+  --force              with --close: stop Chrome even when another session has a tab (a stuck run)
+  --reset              stop both Chromes and clear the locks, registries and pid files (the profiles, and so the
+                       sign-ins, stay): the recovery from a run that was force quit
+  --step-timeout SEC   a step that runs longer fails instead of hanging the run (default 120; lighthouse 300)
   eval JS|@FILE        run JS in the page and print the result: an expression, or statements as in the DevTools
                        console (the last one's value, or a top-level return's); promises are awaited. @FILE
                        reads the script from a file, so quotes and newlines need no shell escaping

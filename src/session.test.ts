@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { acquireLock, activeSessions, callerId, sessionKey, staleSessions, TAB_IDLE_MS, type Proc } from './session.ts'
+import { acquireLock, activeSessions, callerId, lockHolder, procStart, sessionKey, staleSessions, TAB_IDLE_MS, type Proc } from './session.ts'
 
 const procs: Proc[] = [
   { pid: 10, ppid: 1, start: 'Mon Oct 19 05:00:00 2026', comm: '/Applications/Warp.app/Contents/MacOS/stable' },
@@ -35,6 +35,19 @@ test('stale and active sessions leave out this one and locked ones', () => {
   const locked = (k: string) => k === 'busy'
   assert.deepEqual(staleSessions(reg, 'me', now, locked), ['old'])
   assert.deepEqual(activeSessions(reg, 'me', now, locked).sort(), ['busy', 'fresh'])
+})
+
+test('a lock whose pid now belongs to another process is stale (a force quit cannot wedge the next run)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ui-check-lock-'))
+  try {
+    const file = join(dir, 'x.lock')
+    writeFileSync(file, `${process.pid}\nMon Oct 19 05:00:00 1998`)
+    assert.equal(lockHolder(file), null, 'the start time does not match this process')
+    const release = await acquireLock(file, 200)
+    release()
+    writeFileSync(file, `${process.pid}\n${procStart(process.pid)}`)
+    assert.equal(lockHolder(file), process.pid)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
 test('a lock waits for a live holder and takes over a dead one', async () => {

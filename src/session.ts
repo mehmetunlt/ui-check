@@ -55,6 +55,19 @@ export function listProcs(): Proc[] {
   } catch { return [] }
 }
 
+const statCache = new Map<number, { at: number; stat: string | null }>()
+
+/** A process's state (ps stat): Z is a zombie, which kill(0) still reports as alive until its parent reaps it. */
+export function procStat(pid: number): string | null {
+  const now = Date.now()
+  const hit = statCache.get(pid)
+  if (hit && now - hit.at < 1_000) return hit.stat
+  let stat: string | null = null
+  try { stat = execFileSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8', timeout: 2_000 }).trim() || null } catch { stat = null }
+  statCache.set(pid, { at: now, stat })
+  return stat
+}
+
 export function alive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try { process.kill(pid, 0); return true } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM' }
@@ -62,12 +75,47 @@ export function alive(pid: number): boolean {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** The pid holding a lock file, if that process is still alive. */
-export function lockHolder(file: string): number | null {
+const startCache = new Map<number, { at: number; start: string | null }>()
+
+/** A process's start time (the ps line's lstart), or null: a reused pid is a different process. Cached for 2 s. */
+export function procStart(pid: number): string | null {
+  const now = Date.now()
+  const hit = startCache.get(pid)
+  if (hit && now - hit.at < 2_000) return hit.start
+  let start: string | null = null
   try {
-    const pid = Number(readFileSync(file, 'utf8'))
-    return alive(pid) ? pid : null
+    const out = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8', timeout: 2_000 }).trim()
+    start = out ? out.replace(/\s+/g, ' ') : null
+  } catch { start = null }
+  startCache.set(pid, { at: now, start })
+  return start
+}
+
+/** What a lock file says: the pid, and the holder's start time when it was written by this version. */
+export function lockInfo(file: string): { pid: number; start: string | null } | null {
+  try {
+    const [pidLine, ...rest] = readFileSync(file, 'utf8').trim().split('\n')
+    const pid = Number(pidLine)
+    if (!Number.isInteger(pid) || pid <= 0) return null
+    return { pid, start: rest.join(' ').trim() || null }
   } catch { return null }
+}
+
+/**
+ * The pid holding a lock file, if that process is still the one that took it. A lock from an older ui-check has
+ * only the pid; a live pid counts then. A lock naming a **start time** is dead when the pid now belongs to another
+ * process, which is what a force quit followed by a new process used to wedge: every run waited on a stranger.
+ */
+export function lockHolder(file: string): number | null {
+  const info = lockInfo(file)
+  if (!info || !alive(info.pid)) return null
+  // A killed run can stay a zombie while its npm parent is still alive; it is not a holder.
+  if ((procStat(info.pid) ?? '').startsWith('Z')) return null
+  if (info.start) {
+    const now = procStart(info.pid)
+    if (!now || now !== info.start) return null
+  }
+  return info.pid
 }
 
 /**
@@ -81,7 +129,7 @@ export async function acquireLock(file: string, waitMs: number, onWait?: (pid: n
   for (;;) {
     try {
       const fd = openSync(file, 'wx')
-      writeFileSync(fd, String(process.pid))
+      writeFileSync(fd, `${process.pid}\n${procStart(process.pid) ?? ''}`)
       closeSync(fd)
       let released = false
       return () => { if (!released) { released = true; rmSync(file, { force: true }) } }
